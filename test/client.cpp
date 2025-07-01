@@ -11,15 +11,15 @@
 #include <unistd.h>
 #include <vector>
 #include <random>
-
+#include <gperftools/profiler.h>
 
 //////////////////// workload parameters /////////////////////
 
-// #define USE_CORO
+#define USE_CORO
 const int kCoroCnt = 3;
 
 // #define BENCH_LOCK
-// #define YCSB_D
+#define YCSB_D
 // #define YCSB_E
 
 #if defined(USE_CORO) && defined(YCSB_E)
@@ -269,10 +269,15 @@ void thread_run(int id) {
 #else
   bool lock_bench = false;
 #endif
+  // Timer total_timer;
   tree->run_coroutine(coro_func, id, kCoroCnt, lock_bench, NUM_WARMUP_OPS);
+  // 启动 CPU Profiler (保存到当前目录的 perf.prof 文件)
+  ProfilerStart("perf.prof");
   total_timer.begin();
   tree->run_coroutine(coro_func, id, kCoroCnt, lock_bench,
                       FLAGS_ops_per_thread);
+  // 结束性能分析
+  ProfilerStop();
   total_time[id][0] = total_timer.end();
 
 #else
@@ -288,7 +293,7 @@ void thread_run(int id) {
   uint32_t seed = (dsm_client->get_my_client_id() << 10) + id;
   struct zipf_gen_state state;
   mehcached_zipf_init(&state, FLAGS_key_space, FLAGS_zipf, seed);
-
+  Timer total_timer, timer;
   // warmup
   for (int i = 0; i < NUM_WARMUP_OPS; ++i) {
     uint64_t dis = mehcached_zipf_next(&state);

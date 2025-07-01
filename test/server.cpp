@@ -4,6 +4,8 @@
 #include "Tree.h"
 #include "zipf.h"
 #include "dsm_server.h"
+#include <gperftools/profiler.h>
+
 
 #include <city.h>
 #include <stdlib.h>
@@ -40,9 +42,10 @@ int main(int argc, char *argv[]) {
   config.num_server = FLAGS_server_count;
   config.num_client = FLAGS_client_count;
   dsm_server = DSMServer::GetInstance(config);
-
+  ProfilerStart("perf.prof");
   dsm_server->Run();
-
+  // 结束性能分析
+  ProfilerStop();
   printf("server stopped\n");
   return 0;
 }
