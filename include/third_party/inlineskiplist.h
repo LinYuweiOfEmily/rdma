@@ -69,12 +69,12 @@ public:
 template <class Comparator>
 class InlineSkipList {
  private:
-  struct Node;
-  struct Splice;
 
  public:
   using DecodedKey = \
     typename std::remove_reference<Comparator>::type::DecodedType;
+  struct Splice; // 插入辅助结构，缓存每层前驱/后继
+  struct Node;   // 跳表节点结构体
 
   static const uint16_t kMaxPossibleHeight = 32;
 
@@ -182,8 +182,12 @@ class InlineSkipList {
     // REQUIRES: Valid()
     void Prev();
 
+    Node* GetNode() const;
+
     // Advance to the first entry with a key >= target
     void Seek(const char* target);
+
+    void SeekWithHint(const char* target, void** hint);
 
     // Retreat to the last entry with a key <= target
     void SeekForPrev(const char* target);
@@ -204,13 +208,13 @@ class InlineSkipList {
 
  private:
   const uint16_t kMaxHeight_;
-  const uint16_t kBranching_;
+  const uint16_t kBranching_; // 控制新节点高度的概率因子
   const uint32_t kScaledInverseBranching_;
 
   Allocator* const allocator_;  // Allocator used for allocations of nodes
   // Immutable after construction
   Comparator const compare_;
-  Node* const head_;
+  Node* const head_;  // 跳表头节点
 
   // Modified only by Insert().  Read racily by readers, but stale
   // values are ok.
@@ -219,7 +223,7 @@ class InlineSkipList {
   // seq_splice_ is a Splice used for insertions in the non-concurrent
   // case.  It caches the prev and next found during the most recent
   // non-concurrent insertion.
-  Splice* seq_splice_;
+  Splice* seq_splice_;  // 用于顺序插入的缓存splice
 
   inline int GetMaxHeight() const {
     return max_height_.load(std::memory_order_relaxed);
@@ -245,7 +249,8 @@ class InlineSkipList {
   // Returns the earliest node with a key >= key.
   // Return nullptr if there is no such node.
   Node* FindGreaterOrEqual(const char* key) const;
-
+  template<bool UseHint = true>
+  Node* FindGreaterOrEqualWithHint(const char* key, Splice* splice) const;
   // Return the latest node with a key < key.
   // Return head_ if there is no such node.
   // Fills prev[level] with pointer to previous node at "level" for every
@@ -396,6 +401,11 @@ inline void InlineSkipList<Comparator>::Iterator::Next() {
 }
 
 template <class Comparator>
+inline InlineSkipList<Comparator>::Node* InlineSkipList<Comparator>::Iterator::GetNode() const {
+  return node_;
+}
+
+template <class Comparator>
 inline void InlineSkipList<Comparator>::Iterator::Prev() {
   // Instead of using explicit "prev" links, we just search for the
   // last node that falls before key.
@@ -409,6 +419,16 @@ inline void InlineSkipList<Comparator>::Iterator::Prev() {
 template <class Comparator>
 inline void InlineSkipList<Comparator>::Iterator::Seek(const char* target) {
   node_ = list_->FindGreaterOrEqual(target);
+}
+template <class Comparator>
+inline void InlineSkipList<Comparator>::Iterator::SeekWithHint(const char* target, void** hint) {
+  assert(hint != nullptr);
+  Splice* splice = reinterpret_cast<Splice*>(*hint);
+  // if (splice == nullptr) {
+  //   splice = list_->AllocateSplice();
+  //   *hint = reinterpret_cast<void*>(splice);
+  // }
+  node_ = list_->FindGreaterOrEqualWithHint(target, splice);
 }
 
 template <class Comparator>
@@ -469,6 +489,15 @@ bool InlineSkipList<Comparator>::KeyIsAfterNode(const DecodedKey& key,
 }
 
 template <class Comparator>
+/**
+ * @brief 查找跳表中第一个键大于或等于给定键的节点。
+ * 
+ * 该函数会遍历跳表的高层节点，快速定位到可能包含目标键的区域，
+ * 然后逐步向下层查找，直到找到第一个键大于或等于给定键的节点。
+ * 
+ * @param key 要查找的键。
+ * @return Node* 第一个键大于或等于给定键的节点指针，如果不存在则返回 nullptr。
+ */
 typename InlineSkipList<Comparator>::Node*
 InlineSkipList<Comparator>::FindGreaterOrEqual(const char* key) const {
   // Note: It looks like we could reduce duplication by implementing
@@ -504,6 +533,113 @@ InlineSkipList<Comparator>::FindGreaterOrEqual(const char* key) const {
     }
   }
 }
+template <class Comparator>
+template<bool UseHint>
+typename InlineSkipList<Comparator>::Node* 
+InlineSkipList<Comparator>::FindGreaterOrEqualWithHint(
+    const char* key, typename InlineSkipList<Comparator>::Splice* splice_hint
+) const{
+  // 解码键值用于比较
+  const DecodedKey key_decoded = compare_.decode_key(key);
+  
+  // 如果有有效的splice提示，尝试使用它
+  if (splice_hint != nullptr && splice_hint->height_ > 0) {
+    // 检查splice是否可能包含目标键
+    bool use_hint = true;
+    
+    // 验证splice的边界条件
+    if (splice_hint->prev_[0] != head_ && 
+        !KeyIsAfterNode(key_decoded, splice_hint->prev_[0])) {
+      // 键在splice之前，不使用提示
+      use_hint = false;
+    } else if (splice_hint->next_[0] != nullptr &&
+               KeyIsAfterNode(key_decoded, splice_hint->next_[0])) {
+      // 键在splice之后，不使用提示
+      use_hint = false;
+    }
+    
+    // 验证splice的指针连续性
+    if (use_hint) {
+      for (int i = 0; i < splice_hint->height_; ++i) {
+        if (splice_hint->prev_[i]->Next(i) != splice_hint->next_[i]) {
+          use_hint = false;
+          break;
+        }
+      }
+    }
+    
+    // 如果splice提示有效，从splice位置开始搜索
+    if (use_hint) {
+      Node* x = splice_hint->prev_[0];  // 从最底层开始
+      Node* next = x->Next(0);
+      
+      // 检查是否正好命中
+      if (next != nullptr && compare_(next->Key(), key_decoded) >= 0) {
+        return next;
+      }
+      
+      // 否则从当前位置继续搜索
+      if (next != nullptr && KeyIsAfterNode(key_decoded, x)) {
+        x = next;
+        int level = GetMaxHeight() - 1;
+        Node* last_bigger = nullptr;
+        
+        while (true) {
+          next = x->Next(level);
+          if (next != nullptr) {
+            PREFETCH(next->Next(level), 0, 1);
+          }
+          
+          int cmp = (next == nullptr || next == last_bigger)
+                    ? 1
+                    : compare_(next->Key(), key_decoded);
+          
+          if (cmp == 0 || (cmp > 0 && level == 0)) {
+            return next;
+          } else if (cmp < 0) {
+            x = next;
+          } else {
+            last_bigger = next;
+            level--;
+          }
+        }
+      }
+    }
+  }
+  
+  // 没有有效提示或提示无效，从头节点开始常规搜索
+  Node* x = head_;
+  int level = GetMaxHeight() - 1;
+  Node* last_bigger = nullptr;
+  
+  while (true) {
+    Node* next = x->Next(level);
+    if (next != nullptr) {
+      PREFETCH(next->Next(level), 0, 1);
+    }
+    
+    // 确保列表有序性
+    assert(x == head_ || next == nullptr || KeyIsAfterNode(next->Key(), x));
+    // 确保搜索没有越界
+    assert(x == head_ || KeyIsAfterNode(key_decoded, x));
+    
+    int cmp = (next == nullptr || next == last_bigger)
+              ? 1
+              : compare_(next->Key(), key_decoded);
+    
+    if (cmp == 0 || (cmp > 0 && level == 0)) {
+      return next;
+    } else if (cmp < 0) {
+      // 继续在当前层级搜索
+      x = next;
+    } else {
+      // 切换到下一层级
+      last_bigger = next;
+      level--;
+    }
+  }
+}
+
 
 template <class Comparator>
 typename InlineSkipList<Comparator>::Node*
