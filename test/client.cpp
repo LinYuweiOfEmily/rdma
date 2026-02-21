@@ -19,7 +19,7 @@
 const int kCoroCnt = 3;
 
 // #define BENCH_LOCK
-#define YCSB_D
+// #define YCSB_D
 // #define YCSB_E
 
 #if defined(USE_CORO) && defined(YCSB_E)
@@ -355,6 +355,8 @@ void print_args() {
 }
 
 
+
+
 int main(int argc, char *argv[]) {
   gflags::ParseCommandLineFlags(&argc, &argv, true);
   print_args();
@@ -397,6 +399,8 @@ int main(int argc, char *argv[]) {
       th[i].join();
     }
   }
+
+  tree->print_lock_stats(); 
   delete tree;
 
   uint64_t cluster_prefill_tp = dsm_client->Sum((uint64_t)(prefill_tp * 1000));
@@ -412,6 +416,7 @@ int main(int argc, char *argv[]) {
 
   uint64_t stat_lat[lat_end];
   uint64_t stat_cnt[lat_end];
+  
   for (int k = 0; k < lat_end; k++) {
     stat_lat[k] = 0;
     stat_cnt[k] = 0;
@@ -422,6 +427,60 @@ int main(int argc, char *argv[]) {
       stat_helper.counter_[i][k] = 0;
     }
   }
+
+  uint64_t total_requests = 0;
+  uint64_t histogram[LATENCY_WINDOWS] = {0};
+  for (int thread_id = 0; thread_id < MAX_APP_THREAD; thread_id++) {
+      for (int bucket = 0; bucket < LATENCY_WINDOWS; bucket++) {
+          histogram[bucket] += latency[thread_id][bucket];
+          total_requests += latency[thread_id][bucket];
+      }
+  }
+
+  // 计算各个百分位
+  uint64_t target_p25 = total_requests * 0.25;
+  uint64_t target_p50 = total_requests * 0.50;
+  uint64_t target_p75 = total_requests * 0.75;
+  uint64_t target_p99 = total_requests * 0.99;
+
+  uint64_t accumulated = 0;
+  int p25_bucket = LATENCY_WINDOWS - 1;
+  int p50_bucket = LATENCY_WINDOWS - 1;
+  int p75_bucket = LATENCY_WINDOWS - 1;
+  int p99_bucket = LATENCY_WINDOWS - 1;
+
+  bool found_p25 = false;
+  bool found_p50 = false;
+  bool found_p75 = false;
+  bool found_p99 = false;
+
+  for (int bucket = 0; bucket < LATENCY_WINDOWS; bucket++) {
+      accumulated += histogram[bucket];
+      
+      if (!found_p25 && accumulated >= target_p25) {
+          p25_bucket = bucket;
+          found_p25 = true;
+      }
+      if (!found_p50 && accumulated >= target_p50) {
+          p50_bucket = bucket;
+          found_p50 = true;
+      }
+      if (!found_p75 && accumulated >= target_p75) {
+          p75_bucket = bucket;
+          found_p75 = true;
+      }
+      if (!found_p99 && accumulated >= target_p99) {
+          p99_bucket = bucket;
+          found_p99 = true;
+      }
+      
+      // 如果都找到了，可以提前退出
+      if (found_p25 && found_p50 && found_p75 && found_p99) {
+          break;
+      }
+  }
+
+
 
   uint64_t cluster_tp = dsm_client->Sum((uint64_t)(all_tp * 1000));
   printf("CN: %d, throughput %.4f Mops/s\n", dsm_client->get_my_client_id(),
@@ -449,11 +508,17 @@ int main(int argc, char *argv[]) {
     // printf("%d avg cache search latency: %.1lf\n",
     //        dsm_client->get_my_client_id(),
     //        (double)stat_lat[lat_cache_search] / stat_cnt[lat_cache_search]);
-    printf("Final Results: TP: %.3lf Mops/s Lat: %.3lf us\n",
-           cluster_tp / 1000.0,
-           (double)stat_lat[lat_op] / stat_cnt[lat_op] / 1000.0);
+    printf("Final Results: TP: %.3lf Mops/s\n",
+           cluster_tp / 1000.0);
+    
   }
-
+  printf("Lat: %.3lf us\n",
+           (double)stat_lat[lat_op] / stat_cnt[lat_op] / 1000.0);
+  printf("=== Latency Percentiles ===\n");
+  printf("P25: %.2f us\n", p25_bucket / 10.0);
+  printf("P50: %.2f us\n", p50_bucket / 10.0);
+  printf("P75: %.2f us\n", p75_bucket / 10.0);
+  printf("P99: %.2f us\n", p99_bucket / 10.0);
   if (dsm_client->get_my_client_id() == 0) {
     RawMessage m;
     m.type = RpcType ::TERMINATE;

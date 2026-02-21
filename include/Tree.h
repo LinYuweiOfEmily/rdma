@@ -10,10 +10,21 @@
 #include <iostream>
 #include <boost/crc.hpp>
 
+
+// #define ENABLE_STATS
+
 class IndexCache;
 extern uint64_t cache_miss[MAX_APP_THREAD][8];
 extern uint64_t cache_hit[MAX_APP_THREAD][8];
 extern uint64_t latency[MAX_APP_THREAD][LATENCY_WINDOWS];
+extern uint64_t tries_per_lock[MAX_APP_THREAD][5001];       // 单次拿锁最大尝试次数
+
+#if ENABLE_STATS
+extern uint64_t probe_counts;
+extern uint64_t call_find_counts;
+#endif
+
+
 
 static inline uint32_t crc32(const char *buf, size_t len) {
   boost::crc_32_type result;
@@ -401,10 +412,12 @@ constexpr int kLeafCardinality = kNumGroup * kAssociativity * 3;
 static inline int key_hash_bucket(const Key &k) { return k % kNumBucket; }
 
 struct __attribute__((packed)) LeafEntryGroup {
+  // 两个桶共享一个溢出桶
   LeafEntry front[kAssociativity];
   LeafEntry overflow[kAssociativity];
   LeafEntry back[kAssociativity];
 
+  // 有一致性检查
   bool check_consistency(bool is_front, uint8_t version,
                          uint8_t &actual_version) {
     if (is_front) {
@@ -424,16 +437,22 @@ struct __attribute__((packed)) LeafEntryGroup {
     }
     return true;
   }
-
+  // 原子更新group的版本号
   void set_version(uint8_t ver) {
     front[0].lv.cl_ver = ver;
     overflow[0].lv.cl_ver = ver;
     back[0].lv.cl_ver = ver;
   }
-
+  // 查找键值
   bool find(const Key &k, SearchResult &result, bool is_front) {
+  #if ENABLE_STATS
+    call_find_counts++;
+  #endif
     if (is_front) {
       for (int i = 0; i < kAssociativity; ++i) {
+      #if ENABLE_STATS
+            probe_counts++;
+      #endif
         if (front[i].key == k && front[i].lv.val != kValueNull) {
           result.val = front[i].lv.val;
           return true;
@@ -441,6 +460,9 @@ struct __attribute__((packed)) LeafEntryGroup {
       }
     } else {
       for (int i = 0; i < kAssociativity; ++i) {
+      #if ENABLE_STATS
+            probe_counts++;
+      #endif
         if (back[i].key == k && back[i].lv.val != kValueNull) {
           result.val = back[i].lv.val;
           return true;
@@ -448,6 +470,9 @@ struct __attribute__((packed)) LeafEntryGroup {
       }
     }
     for (int i = 0; i < kAssociativity; ++i) {
+    #if ENABLE_STATS
+            probe_counts++;
+    #endif
       if (overflow[i].key == k && overflow[i].lv.val != kValueNull) {
         result.val = overflow[i].lv.val;
         return true;
@@ -496,8 +521,14 @@ struct __attribute__((packed)) LeafEntryGroup {
   bool find(const Key &k, bool is_front, LeafEntry **entry_addr,
             LeafEntry **empty_addr) {
     // find main bucket
+#if ENABLE_STATS
+    call_find_counts++;
+#endif
     LeafEntry *bucket = is_front ? front : back;
     for (int i = 0; i < kAssociativity; ++i) {
+#if ENABLE_STATS
+            probe_counts++;
+#endif
       if (bucket[i].key == k) {
         if (entry_addr) {
           *entry_addr = &bucket[i];
@@ -510,6 +541,9 @@ struct __attribute__((packed)) LeafEntryGroup {
     }
     // find overflow
     for (int i = 0; i < kAssociativity; ++i) {
+#if ENABLE_STATS
+            probe_counts++;
+#endif
       if (overflow[i].key == k) {
         if (entry_addr) {
           *entry_addr = &overflow[i];
@@ -586,6 +620,8 @@ class Tree {
 
   void index_cache_statistics();
   void clear_statistics();
+  void print_lock_stats();
+
 
  private:
   DSMClient *dsm_client_;
@@ -609,6 +645,8 @@ class Tree {
 
   GlobalAddress get_root_ptr_ptr();
   GlobalAddress get_root_ptr(CoroContext *ctx, bool force_read = false);
+
+
 
   void coro_worker(CoroYield &yield, RequstGen *gen, int coro_id,
                    bool lock_bench);

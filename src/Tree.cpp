@@ -6,15 +6,20 @@
 #include <queue>
 #include <utility>
 #include <vector>
+#include <emmintrin.h>
 
 #include "IndexCache.h"
 #include "RdmaBuffer.h"
 #include "Timer.h"
+#include "Common.h"
 
+// #define USE_AP
 #define USE_SX_LOCK
 #define BATCH_LOCK_READ
 #define FINE_GRAINED_LEAF_NODE
 #define FINE_GRAINED_INTERNAL_NODE
+#define USE_BATCH_POLL
+// #define ENABLE_STATS
 // #define USE_CRC
 // #define USE_LOCAL_LOCK
 
@@ -25,6 +30,18 @@
 uint64_t cache_miss[MAX_APP_THREAD][8];
 uint64_t cache_hit[MAX_APP_THREAD][8];
 uint64_t latency[MAX_APP_THREAD][LATENCY_WINDOWS];
+#ifdef ENABLE_STATS
+uint64_t probe_counts = 0;
+uint64_t call_find_counts = 0;
+#endif
+thread_local uint64_t total_cmp = 0;
+thread_local uint64_t total_seek = 0;
+
+// 统计变量
+uint64_t tries_per_lock[MAX_APP_THREAD][5001];       // 单次拿锁最大尝试次数
+
+
+
 
 StatHelper stat_helper;
 
@@ -52,6 +69,7 @@ thread_local std::queue<uint16_t> hot_wait_queue;
 
 Tree::Tree(DSMClient *dsm_client, uint16_t tree_id)
     : dsm_client_(dsm_client), tree_id(tree_id) {
+  // 分配锁
   for (int i = 0; i < dsm_client_->get_server_size(); ++i) {
     local_locks[i] = new LocalLockNode[define::kNumOfLock];
     for (size_t k = 0; k < define::kNumOfLock; ++k) {
@@ -193,6 +211,8 @@ bool Tree::update_new_root(GlobalAddress left, const Key &k,
 }
 inline bool Tree::try_lock_addr(GlobalAddress lock_addr, uint64_t *buf,
                                 CoroContext *ctx) {
+
+  u_int16_t my_thread_id = dsm_client_->get_my_thread_id();     
 #ifdef USE_LOCAL_LOCK
   bool hand_over = acquire_local_lock(lock_addr, ctx, ctx ? ctx->coro_id : 0);
   if (hand_over) {
@@ -207,6 +227,9 @@ inline bool Tree::try_lock_addr(GlobalAddress lock_addr, uint64_t *buf,
   retry:
     retry_cnt++;
     if (retry_cnt > 5000000) {
+      // 记录这次失败的尝试
+      tries_per_lock[my_thread_id][5000]++;
+
       std::cout << "Deadlock " << lock_addr << std::endl;
 
       std::cout << dsm_client_->get_my_client_id() << ", "
@@ -228,9 +251,83 @@ inline bool Tree::try_lock_addr(GlobalAddress lock_addr, uint64_t *buf,
       }
       goto retry;
     }
-  }
+    tries_per_lock[my_thread_id][retry_cnt + 1]++;
 
+  }
+  // 成功获取共享锁
   return true;
+}
+
+void Tree::print_lock_stats() {
+    uint64_t global_hist[5001] = {0}; // 初始化为0
+
+    for (int t = 0; t < MAX_APP_THREAD; ++t) {
+        for (int k = 1; k <= 5000; ++k) { // 跳过 k=0（除非你明确使用）
+            global_hist[k] += tries_per_lock[t][k];
+        }
+    }
+
+    uint64_t total_events = 0;
+    for (int k = 1; k <= 5000; ++k) {
+        total_events += global_hist[k];
+    }
+    if (total_events == 0) {
+        // 无数据，无法计算
+        return;
+    }
+
+
+    double targets[] = {0.25, 0.50, 0.75, 0.99};
+    int result[4] = {0};
+    int target_idx = 0;
+
+    uint64_t cumsum = 0;
+    for (int k = 1; k <= 5000; ++k) {
+        cumsum += global_hist[k];
+        double ratio = static_cast<double>(cumsum) / total_events;
+
+        // 满足当前及之前所有未满足的分位点
+        while (target_idx < 4 && ratio >= targets[target_idx]) {
+            result[target_idx] = k;
+            target_idx++;
+        }
+        if (target_idx >= 4) break; // 所有分位已找到
+    }
+
+    // 处理极端情况：如果 99% 仍未达到（长尾超出 5000）
+    if (target_idx < 4) {
+        // 说明即使 k=5000，累积比例仍 < 0.99
+        // 可设为 >5000，或报 warning
+        for (int i = target_idx; i < 4; ++i) {
+            result[i] = 5001; // 表示 "超过 5000 次"
+        }
+    }
+    printf("Lock retry count percentiles:\n");
+    printf("  P25: %d\n", result[0]);
+    printf("  P50: %d\n", result[1]);
+    printf("  P75: %d\n", result[2]);
+    printf("  P99: %d\n", result[3]);
+    // 导出直方图为 CSV
+    FILE* csv = fopen("lock_retry_histogram.csv", "w");
+    if (csv) {
+        fprintf(csv, "retry_count,frequency\n"); // 表头
+        for (int k = 1; k <= 5000; ++k) {
+            if (global_hist[k] > 0) { // 只输出非零项（可选）
+                fprintf(csv, "%d,%llu\n", k, (unsigned long long)global_hist[k]);
+            }
+        }
+        fclose(csv);
+        printf("Histogram exported to lock_retry_histogram.csv\n");
+    }
+    #ifdef ENABLE_STATS
+    double avg_probes = (double)probe_counts / (double)call_find_counts;
+    printf("Total probes: %llu\n", (unsigned long long)probe_counts);
+    printf("Total call find: %llu\n", (unsigned long long)call_find_counts);
+    printf("Average probes per search: %.3f\n", avg_probes);
+    #endif
+    double avg = double(total_cmp) / total_seek;
+    printf("Average compares per seek: %.3f\n", avg);
+
 }
 
 inline void Tree::unlock_addr(GlobalAddress lock_addr, uint64_t *buf,
@@ -270,7 +367,7 @@ inline void Tree::acquire_sx_lock(GlobalAddress lock_addr,
 
   dsm_client_->FaaDmBoundSync(lock_addr, 3, add_val, lock_buffer,
                               XS_LOCK_FAA_MASK, ctx);
-
+  u_int16_t my_thread_id = dsm_client_->get_my_thread_id();                        
   uint16_t s_tic = *lock_buffer & 0xffff;
   uint16_t s_cnt = (*lock_buffer >> 16) & 0xffff;
   uint16_t x_tic = (*lock_buffer >> 32) & 0xffff;
@@ -283,11 +380,15 @@ inline void Tree::acquire_sx_lock(GlobalAddress lock_addr,
 retry:
   if (share_lock && x_cnt == x_tic) {
     // ok
+    // 成功获取共享锁
+    tries_per_lock[my_thread_id][retry_cnt + 1]++;
   } else if (!share_lock && x_cnt == x_tic && s_cnt == s_tic) {
     // ok
+    tries_per_lock[my_thread_id][retry_cnt + 1]++;
   } else {
     ++retry_cnt;
     if (retry_cnt > 5000000) {
+      tries_per_lock[my_thread_id][5000]++;
       printf(
           "Deadlock [%u, %lu] my thread %d coro_id %d try %d lock upgrade "
           "%d\n",
@@ -470,8 +571,9 @@ void Tree::lock_and_read(GlobalAddress lock_addr, bool share_lock,
                          bool upgrade_from_s, uint64_t *lock_buffer,
                          GlobalAddress read_addr, int read_size,
                          char *read_buffer, CoroContext *ctx) {
+  u_int16_t my_thread_id = dsm_client_->get_my_thread_id();                        
 #ifdef BATCH_LOCK_READ
-
+  // 统计总拿锁操作次数
 #ifdef USE_SX_LOCK
   assert(!upgrade_from_s || !share_lock);
   uint64_t add_val;
@@ -497,11 +599,17 @@ void Tree::lock_and_read(GlobalAddress lock_addr, bool share_lock,
 retry:
   if (share_lock && x_cnt == x_tic) {
     // ok
+    // 成功获取共享锁
+    tries_per_lock[my_thread_id][retry_cnt + 1]++;
   } else if (!share_lock && x_cnt == x_tic && s_cnt == s_tic) {
     // ok
+    // 成功获取排他锁
+    tries_per_lock[my_thread_id][retry_cnt + 1]++;
   } else {
     ++retry_cnt;
     if (retry_cnt > 5000000) {
+      // 记录这次失败的尝试
+      tries_per_lock[my_thread_id][5000]++;
       printf(
           "Deadlock [%u, %lu] my thread %d coro_id %d try %d lock upgrade "
           "%d\n",
@@ -2115,13 +2223,13 @@ void Tree::coro_worker(CoroYield &yield, RequstGen *gen, int coro_id,
   ctx.yield = &yield;
 
   Timer coro_timer;
-  // auto thread_id = dsm_client_->get_my_thread_id();
+  auto thread_id = dsm_client_->get_my_thread_id();
 
   // while (true) {
   while (coro_ops_cnt_start < coro_ops_total) {
     auto r = gen->next();
 
-    // coro_timer.begin();
+    coro_timer.begin();
     ++coro_ops_cnt_start;
     if (lock_bench) {
       this->lock_bench(r.k, &ctx, coro_id);
@@ -2133,13 +2241,13 @@ void Tree::coro_worker(CoroYield &yield, RequstGen *gen, int coro_id,
         this->insert(r.k, r.v, &ctx);
       }
     }
-    // auto t = coro_timer.end();
-    // auto us_10 = t / 100;
-    // if (us_10 >= LATENCY_WINDOWS) {
-    //   us_10 = LATENCY_WINDOWS - 1;
-    // }
-    // latency[thread_id][us_10]++;
-    // stat_helper.add(thread_id, lat_op, t);
+    auto t = coro_timer.end();
+    auto us_10 = t / 100;
+    if (us_10 >= LATENCY_WINDOWS) {
+      us_10 = LATENCY_WINDOWS - 1;
+    }
+    latency[thread_id][us_10]++;
+    stat_helper.add(thread_id, lat_op, t);
     ++coro_ops_cnt_finish;
   }
   // printf("thread %d coro_id %d start %lu finish %lu\n",
@@ -2154,24 +2262,133 @@ void Tree::coro_master(CoroYield &yield, int coro_cnt) {
     yield(worker[i]);
   }
 
-  // while (true) {
+  uint64_t poll_total = 0;
+  uint64_t poll_hit = 0;
+  uint64_t total_poll_time_ns = 0;  // 累计轮询时间（纳秒）
+#ifdef USE_AP
+  // 配置参数
+  int spin_gap = 8;           // 初始比较小
+  const int SPIN_MIN = 1;
+  // const int SPIN_MAX = 4096;  // 上限调大，因为负载可能非常低
+  const int MISS_THRESHOLD = 16; // 超过这个 miss 次数就进入事件驱动
+
+  int idle_counter = 0;
+  int miss_counter = 0;
+
+  while (coro_ops_cnt_finish < coro_ops_total) {
+    uint64_t next_coro_id;
+    while (dsm_client_->get_pending_event_count() == 0) {}
+    if (++idle_counter < spin_gap) {
+      _mm_pause();
+      continue;
+    }
+    idle_counter = 0;
+
+    ++poll_total;
+    if (dsm_client_->PollRdmaCqOnce(next_coro_id)) {
+      ++poll_hit;
+      miss_counter = 0;
+
+      yield(worker[next_coro_id]);
+      
+      // 命中 → 乘法减小
+      dsm_client_->decrease_pending_event();
+      spin_gap >>= 1;
+      if (spin_gap < SPIN_MIN) spin_gap = SPIN_MIN;
+
+    } else {
+      // 未命中 → 线性增加
+      spin_gap += 8;
+      // if (spin_gap > SPIN_MAX) spin_gap = SPIN_MAX;
+
+      ++miss_counter;
+      if (miss_counter > MISS_THRESHOLD) {
+        // === 进入事件驱动模式 ===
+        struct ibv_cq *ev_cq;
+        void *ev_ctx;
+        if (ibv_get_cq_event(dsm_client_->get_comp_channel(),
+                             &ev_cq, &ev_ctx) == 0) {
+          ibv_ack_cq_events(ev_cq, 1);
+          ibv_req_notify_cq(ev_cq, 0);
+
+          // 醒来后立刻 poll 一次
+          if (dsm_client_->PollRdmaCqOnce(next_coro_id)) {
+            ++poll_hit;
+            yield(worker[next_coro_id]);
+            dsm_client_->decrease_pending_event();
+          }
+        }
+        // 回到短 spin 模式
+        miss_counter = 0;
+        spin_gap = SPIN_MIN;
+      }
+    }
+  }
+#elif defined(USE_BATCH_POLL)
+ // 核心优化 1：设置合理的批量大小（过小摊薄不够，过大增加尾延迟，16-32是黄金甜点）
+  const int BATCH_CQ_SIZE = 16;
+  uint64_t ready_coros[BATCH_CQ_SIZE];
+
+  while (coro_ops_cnt_finish < coro_ops_total) {
+    ++poll_total;
+    
+    // 核心优化 2：一次性收割多个网卡完成事件
+    int n = dsm_client_->PollRdmaCqBatch(BATCH_CQ_SIZE, ready_coros);
+    
+    if (n > 0) {
+      poll_hit += n; // 或者只 ++poll_hit，看你想要统计物理命中次数还是逻辑命中数
+      
+      // 核心优化 3：集中唤醒！
+      // 减少 master 在无数据时频繁介入，一口气把就绪的协程全跑一遍
+      for (int i = 0; i < n; ++i) {
+        yield(worker[ready_coros[i]]);
+      }
+    } else {
+      // 核心优化 4：微架构级暂停 (Micro-architectural Pause)
+      // 当网卡真的没数据时，不要疯狂 while(true) 空转抢占 CPU 发热
+      // _mm_pause 会让 CPU 休息几十个周期，极大降低功耗并让出超线程资源
+      _mm_pause(); 
+    }
+  }
+#else 
   while (coro_ops_cnt_finish < coro_ops_total) {
     uint64_t next_coro_id;
 
-    if (dsm_client_->PollRdmaCqOnce(next_coro_id)) {
+    ++poll_total;
+    // auto start = std::chrono::high_resolution_clock::now();
+    
+    bool poll_result = dsm_client_->PollRdmaCqOnce(next_coro_id);
+    
+    // 结束计时
+    // auto end = std::chrono::high_resolution_clock::now();
+    // auto duration = std::chrono::duration_cast<std::chrono::nanoseconds>(end - start);
+    // total_poll_time_ns += duration.count();
+        
+    if (poll_result) {
+      ++poll_hit;
       yield(worker[next_coro_id]);
     }
-
-    // if (!hot_wait_queue.empty()) {
-    //   next_coro_id = hot_wait_queue.front();
-    //   hot_wait_queue.pop();
-    //   yield(worker[next_coro_id]);
-    // }
   }
-  // printf("thread %d master start %lu finish %lu\n",
-  //        dsm_client_->get_my_thread_id(), coro_ops_cnt_start,
-  //        coro_ops_cnt_finish);
-  // fflush(stdout);
+
+#endif 
+  // 计算统计信息
+  double hit_rate = (poll_total > 0) 
+                    ? (double)poll_hit / (double)poll_total 
+                    : 0.0;
+  
+  // double avg_poll_time_ns = (poll_total > 0)
+  //                          ? (double)total_poll_time_ns / (double)poll_total
+  //                          : 0.0;
+  
+  // double avg_poll_time_us = avg_poll_time_ns / 1000.0;
+  
+  printf("thread %d poll hit rate: %.2f%% (%lu/%lu)\n",
+         dsm_client_->get_my_thread_id(),
+         hit_rate * 100, poll_hit, poll_total);
+  // printf("thread %d average poll time: %.3f us (%.3f ns), total polls: %lu\n",
+  //        dsm_client_->get_my_thread_id(),
+  //        avg_poll_time_us, avg_poll_time_ns, poll_total);
+  fflush(stdout);
 }
 
 #ifdef USE_LOCAL_LOCK

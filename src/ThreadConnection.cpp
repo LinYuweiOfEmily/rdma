@@ -9,7 +9,10 @@ ThreadConnection::ThreadConnection(uint16_t threadID, void *cachePool,
     : threadID(threadID), conn_to_server(remote_conn) {
   createContext(&ctx, rnic_id);
 
-  cq = ibv_create_cq(ctx.ctx, RAW_RECV_CQ_COUNT, NULL, NULL, 0);
+  // cq = ibv_create_cq(ctx.ctx, RAW_RECV_CQ_COUNT, NULL, NULL, 0);
+  comp_channel = ibv_create_comp_channel(ctx.ctx);
+  cq = ibv_create_cq(ctx.ctx, RAW_RECV_CQ_COUNT, NULL, comp_channel, 0);
+  ibv_req_notify_cq(cq, 0);
   // rpc_cq = cq;
   rpc_cq = ibv_create_cq(ctx.ctx, RAW_RECV_CQ_COUNT, NULL, NULL, 0);
 

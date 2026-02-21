@@ -23,9 +23,12 @@ inline static CacheEntry Decode(const char *val) { return *(CacheEntry *)val; }
 struct CacheEntryComparator {
   typedef CacheEntry DecodedType;
 
+  inline static thread_local uint64_t cmp_cnt = 0;
+
   static DecodedType decode_key(const char *b) { return Decode(b); }
 
   int cmp(const DecodedType a_v, const DecodedType b_v) const {
+    ++cmp_cnt;
     if (a_v.to < b_v.to) {
       return -1;
     }

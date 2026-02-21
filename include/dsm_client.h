@@ -32,6 +32,11 @@ class DSMClient {
   uint16_t get_server_size() { return conf_.num_server; }
   uint16_t get_client_size() { return conf_.num_client; }
   uint64_t get_thread_tag() { return thread_tag_; }
+  inline void decrease_pending_event() { --pending_event_count_; }
+  inline void increase_pending_event() { ++pending_event_count_; }
+  inline uint64_t get_pending_event_count() { return pending_event_count_; }
+  ibv_comp_channel* get_comp_channel() {return  i_con_->comp_channel;}
+
 
   void Barrier(const std::string &ss) {
     keeper_->Barrier(ss, conf_.num_client, my_client_id_ == 0);
@@ -148,6 +153,7 @@ class DSMClient {
 
   uint64_t PollRdmaCq(int count = 1);
   bool PollRdmaCqOnce(uint64_t &wr_id);
+  int PollRdmaCqBatch(int max_entries, uint64_t *wr_ids);
 
   uint64_t Sum(uint64_t value) {
     static uint64_t count = 0;
@@ -208,7 +214,7 @@ class DSMClient {
   static thread_local LocalAllocator local_allocator_;
   static thread_local RdmaBuffer rbuf_[define::kMaxCoro];
   static thread_local uint64_t thread_tag_;
-
+  static thread_local uint64_t pending_event_count_;
   RemoteConnectionToServer *conn_to_server_;
 
   ThreadConnection *th_con_[MAX_APP_THREAD];

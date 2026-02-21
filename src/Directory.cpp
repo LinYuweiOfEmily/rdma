@@ -4,6 +4,8 @@
 #include "connection.h"
 #include "DirectoryConnection.h"
 
+// #define USE_BATCH
+
 GlobalAddress g_root_ptr = GlobalAddress::Null();
 int g_root_level = -1;
 bool enable_cache = true;
@@ -29,29 +31,37 @@ void Directory::dirThread() {
   Debug::notifyInfo("thread %d in memory nodes runs...\n", dirID);
 
   while (!stop_flag.load(std::memory_order_acquire)) {
-    struct ibv_wc wc;
-    pollWithCQ(dCon->cq, 1, &wc);
+#ifdef USE_BATCH
+    struct ibv_wc wc_buf[32];
+    int n = pollWithCQ(dCon->cq, 32, wc_buf);
+#else
+    struct ibv_wc wc_buf[1];
+    int n = pollWithCQ(dCon->cq, 1, wc_buf);
+#endif
+    for (int i = 0; i < n; i++) {
+      auto wc = wc_buf[i];
+      switch (int(wc.opcode)) {
+        case IBV_WC_RECV: // control message
+        {
 
-    switch (int(wc.opcode)) {
-    case IBV_WC_RECV: // control message
-    {
+          auto *m = (RawMessage *)dCon->message->getMessage();
 
-      auto *m = (RawMessage *)dCon->message->getMessage();
+          process_message(m);
 
-      process_message(m);
+          break;
+        }
+        case IBV_WC_RDMA_WRITE: {
+          break;
+        }
+        case IBV_WC_RECV_RDMA_WITH_IMM: {
 
-      break;
+          break;
+        }
+        default:
+          assert(false);
+        }
     }
-    case IBV_WC_RDMA_WRITE: {
-      break;
-    }
-    case IBV_WC_RECV_RDMA_WITH_IMM: {
-
-      break;
-    }
-    default:
-      assert(false);
-    }
+    
   }
 }
 

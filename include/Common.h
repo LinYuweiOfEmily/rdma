@@ -25,6 +25,7 @@
 #define KEY_SIZE 8
 
 #define LATENCY_WINDOWS 1000000
+#define MAX_TRIES_PER_LOCK 5000000
 
 #define STRUCT_OFFSET(type, field) \
   (char *)&((type *)(0))->field - (char *)((type *)(0))
@@ -40,14 +41,14 @@
 #define RAW_RECV_CQ_COUNT 128
 
 // { app thread
-#define MAX_APP_THREAD 50
+#define MAX_APP_THREAD 90
 
 #define APP_MESSAGE_NR 96
 
 // }
 
 // { dir thread
-#define NR_DIRECTORY 1
+#define NR_DIRECTORY 1  
 
 #define DIR_MESSAGE_NR 128
 // }

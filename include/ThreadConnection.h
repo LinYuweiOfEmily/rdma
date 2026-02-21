@@ -12,6 +12,8 @@ struct ThreadConnection {
   uint16_t threadID;
 
   RdmaContext ctx;
+  ibv_comp_channel *comp_channel;  // 保存事件通道
+
   ibv_cq *cq; // for one-side verbs
   ibv_cq *rpc_cq;
 

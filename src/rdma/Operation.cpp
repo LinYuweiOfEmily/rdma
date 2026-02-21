@@ -2,13 +2,20 @@
 
 int pollWithCQ(ibv_cq *cq, int pollNumber, struct ibv_wc *wc) {
   int count = 0;
-
+  int retry = 0;
   do {
 
-    int new_count = ibv_poll_cq(cq, 1, wc);
+    int new_count = ibv_poll_cq(cq, pollNumber - count, wc + count);
     count += new_count;
-
-  } while (count < pollNumber);
+    if (count < 1) {
+      continue;
+    }
+    if (new_count == 0) {
+      retry++;
+    } else {
+      retry = 0;
+    }
+  } while (count < pollNumber && retry < 1000);
 
   if (count < 0) {
     Debug::notifyError("Poll Completion failed.");
@@ -16,13 +23,15 @@ int pollWithCQ(ibv_cq *cq, int pollNumber, struct ibv_wc *wc) {
     return -1;
   }
 
-  if (wc->status != IBV_WC_SUCCESS) {
-    Debug::notifyError("Failed status %s (%d) for wr_id %d",
-                       ibv_wc_status_str(wc->status), wc->status,
-                       (int)wc->wr_id);
-    assert(false);
-    sleep(5);
-    return -1;
+  for (int i = 0; i < count; ++i) {
+    if (wc[i].status != IBV_WC_SUCCESS) {
+      Debug::notifyError("Failed status %s (%d) for wr_id %d",
+                         ibv_wc_status_str(wc[i].status), wc[i].status,
+                         (int)wc[i].wr_id);
+      assert(false);
+      sleep(5);
+      return -1;
+    }
   }
 
   return count;

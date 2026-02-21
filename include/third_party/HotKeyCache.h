@@ -20,14 +20,11 @@ public:
           eviction_batch_size(max_sz * EVICTION_BATCH_RATIO / 100) {}
 
     typename InlineSkipList<Comparator>::Node* Get(const Key& key) {
-        cms.record(key);  // <<<< 记录访问
+        thread_local uint32_t rng = 1;
+        if ((++rng & 0xF) == 0) cms.record(key);
         typename InlineSkipList<Comparator>::Node* result = nullptr;
         map.find_fn(key, [&](const HotKeyCacheEntry& entry) {
-            auto val = (const CacheEntry *)entry.node->Key();
-            if (!entry.deleted->load(std::memory_order_acquire)) {
-                entry.access_count->fetch_add(1, std::memory_order_relaxed);
-                result = entry.node;
-            }
+            result = entry.node;
         });
         return result;
 
@@ -38,15 +35,16 @@ public:
             return;  // 频率不够，不加入 cache
         }
         bool updated = map.update_fn(key, [&](HotKeyCacheEntry& entry) {
+            if (entry.node == nullptr) return;
             auto val = (const CacheEntry *)entry.node->Key();
-            if (!entry.deleted->load(std::memory_order_acquire) && val->ptr == nullptr) {
+            if (val->ptr == nullptr) {
                 entry.node = node;  
             }
         });
         if (updated) {
             return;
         }
-        auto entry = HotKeyCacheEntry{node, std::make_unique<std::atomic<uint32_t>>(1), std::make_unique<std::atomic<bool>>(false)};
+        auto entry = HotKeyCacheEntry{node};
         bool success = map.insert(key, std::move(entry));
 
         if (!success) return;
@@ -65,8 +63,6 @@ public:
 private:
     struct HotKeyCacheEntry {
         typename InlineSkipList<Comparator>::Node* node;
-        std::unique_ptr<std::atomic<uint32_t>> access_count;
-        std::unique_ptr<std::atomic<bool>> deleted;
 
     };
 
@@ -77,44 +73,13 @@ private:
     }
     void Evict() {
         auto& tls_keys = GetThreadLocalKeys();
-        uint32_t evicted_count = 0;
+        // uint32_t evicted_count = 0;
         for (auto it = tls_keys.rbegin(); it != tls_keys.rend(); ++it) {
             auto key = *it;
-            HotKeyCacheEntry* entry_ptr = nullptr;
-            map.update_fn(key, [&](HotKeyCacheEntry& entry) {
-                bool expected = false;
-                if (entry.deleted->compare_exchange_strong(expected, true, std::memory_order_relaxed)) {
-                    // 只有第一次从 false 改成 true 才会进这里
-                    evicted_count++;
-                }
-            });
+            map.erase(key);
 
         }
-        current_valid_size.fetch_sub(evicted_count, std::memory_order_relaxed);
         tls_keys.clear();
-        size_t cvs = current_valid_size.load(std::memory_order_acquire);
-        size_t cs = current_size.load(std::memory_order_acquire);
-        if (cvs <  cs * 0.5) {
-            PhysicalCleanup();
-        }
-    }
-
-    void PhysicalCleanup() {
-        auto lock = map.lock_table();
-        size_t removed = 0;
-        
-        for (auto it = lock.begin(); it != lock.end(); ) {
-            if (it->second.deleted->load(std::memory_order_acquire)) {
-                it = lock.erase(it);
-                current_size.fetch_sub(1, std::memory_order_relaxed);
-                ++removed;
-                if (removed >= eviction_batch_size) {
-                    break;
-                }
-            } else {
-                ++it;
-            }
-        }
     }
 
     static constexpr size_t EVICTION_TRIGGER_RATIO = 90; // 触发阈值百分比
@@ -124,7 +89,6 @@ private:
     size_t eviction_trigger_threshold;  // 触发淘汰的大小阈值
     size_t eviction_batch_size;          // 每次淘汰多少个key
     std::atomic_flag evicting_flag = ATOMIC_FLAG_INIT;
-
     
     CountMinSketch cms;
     static constexpr uint32_t CMS_PROMOTION_THRESHOLD = 100;
@@ -136,7 +100,7 @@ private:
 template <class Comparator>
 class HotKeyCache {
 public:
-    HotKeyCache(size_t shard_cnt = 128, size_t per_shard_sz = 512)
+    HotKeyCache(size_t shard_cnt = 16, size_t per_shard_sz = 512)
         : shard_count(shard_cnt) {
         shards.reserve(shard_count);
         for (size_t i = 0; i < shard_count; ++i) {

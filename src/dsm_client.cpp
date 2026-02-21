@@ -6,6 +6,7 @@ thread_local char *DSMClient::rdma_buffer_ = nullptr;
 thread_local LocalAllocator DSMClient::local_allocator_;
 thread_local RdmaBuffer DSMClient::rbuf_[define::kMaxCoro];
 thread_local uint64_t DSMClient::thread_tag_ = 0;
+thread_local uint64_t DSMClient::pending_event_count_ = 0;
 
 DSMClient::DSMClient(const DSMConfig &conf)
     : conf_(conf), app_id_(0), cache_(conf.cache_size) {
@@ -54,6 +55,7 @@ void DSMClient::RegisterThread() {
 
 void DSMClient::Read(char *buffer, GlobalAddress gaddr, size_t size,
                      bool signal, CoroContext *ctx) {
+  increase_pending_event();
   if (ctx == nullptr) {
     rdmaRead(i_con_->data[0][gaddr.nodeID], (uint64_t)buffer,
              conn_to_server_[gaddr.nodeID].dsm_base + gaddr.offset, size,
@@ -80,6 +82,7 @@ void DSMClient::ReadSync(char *buffer, GlobalAddress gaddr, size_t size,
 
 void DSMClient::Write(const char *buffer, GlobalAddress gaddr, size_t size,
                       bool signal, CoroContext *ctx) {
+  increase_pending_event();
   if (ctx == nullptr) {
     rdmaWrite(i_con_->data[0][gaddr.nodeID], (uint64_t)buffer,
               conn_to_server_[gaddr.nodeID].dsm_base + gaddr.offset, size,
@@ -124,7 +127,7 @@ void DSMClient::ReadBatch(RdmaOpRegion *rs, int k, bool signal,
     gaddr.raw = rs[i].dest;
     node_id = gaddr.nodeID;
     FillKeysDest(rs[i], gaddr, rs[i].is_on_chip);
-  }
+  } 
 
   if (ctx == nullptr) {
     rdmaReadBatch(i_con_->data[0][node_id], rs, k, signal);
@@ -671,4 +674,17 @@ bool DSMClient::PollRdmaCqOnce(uint64_t &wr_id) {
   return res == 1;
 }
 
+int DSMClient::PollRdmaCqBatch(int max_entries, uint64_t *wr_ids) {
+  // 分配临时数组接收完成事件
+  ibv_wc wc[max_entries];
+  
+  // 一次性向底层网卡驱动拉取最多 max_entries 个事件
+  int n = pollOnce(i_con_->cq, max_entries, wc);
 
+  // 提取出所有就绪的协程 ID
+  for (int i = 0; i < n; ++i) {
+    wr_ids[i] = wc[i].wr_id;
+  }
+
+  return n;
+}
