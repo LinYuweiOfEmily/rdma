@@ -3,6 +3,7 @@
 #include "Timer.h"
 #include "Tree.h"
 #include "zipf.h"
+#include "Common.h"
 
 #include <city.h>
 #include <stdlib.h>
@@ -16,7 +17,7 @@
 //////////////////// workload parameters /////////////////////
 
 #define USE_CORO
-const int kCoroCnt = 3;
+const int kCoroCnt = define::kCoroCnt;
 
 // #define BENCH_LOCK
 // #define YCSB_D

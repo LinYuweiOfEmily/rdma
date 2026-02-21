@@ -7,6 +7,10 @@ thread_local LocalAllocator DSMClient::local_allocator_;
 thread_local RdmaBuffer DSMClient::rbuf_[define::kMaxCoro];
 thread_local uint64_t DSMClient::thread_tag_ = 0;
 thread_local uint64_t DSMClient::pending_event_count_ = 0;
+thread_local ibv_send_wr DSMClient::coro_wr_[define::kCoroCnt];
+thread_local ibv_sge DSMClient::coro_sge_[define::kCoroCnt];
+thread_local ibv_send_wr** DSMClient::pending_wr_head_ = nullptr;
+thread_local ibv_send_wr** DSMClient::pending_wr_tail_ = nullptr;
 
 DSMClient::DSMClient(const DSMConfig &conf)
     : conf_(conf), app_id_(0), cache_(conf.cache_size) {
@@ -27,6 +31,32 @@ void DSMClient::InitRdmaConnection() {
 
   keeper_ = new DSMClientKeeper(th_con_, conn_to_server_, conf_.num_server);
   my_client_id_ = keeper_->get_my_client_id();
+}
+inline void DSMClient::queue_wr(int node_id, ibv_send_wr* wr) {
+  wr->next = nullptr;
+  if (pending_wr_head_[node_id] == nullptr) {
+    pending_wr_head_[node_id] = wr;
+    pending_wr_tail_[node_id] = wr;
+  } else {
+    pending_wr_tail_[node_id]->next = wr;
+    pending_wr_tail_[node_id] = wr;
+  }
+}
+
+// 集中敲门铃函数：遍历所有目标节点，一次性把长链表 post 出去
+void DSMClient::FlushDoorbell() {
+  for (int i = 0; i < conf_.num_server; ++i) {
+    if (pending_wr_head_[i] != nullptr) {
+      struct ibv_send_wr *bad_wr;
+      // 核心魔法：只进行 1 次 MMIO Write，网卡会顺着 next 指针把整条链表拉走
+      if (ibv_post_send(i_con_->data[0][i], pending_wr_head_[i], &bad_wr)) {
+        Debug::notifyError("Batch doorbell failed for node %d", i);
+      }
+      // 清空队列，准备下一轮
+      pending_wr_head_[i] = nullptr;
+      pending_wr_tail_[i] = nullptr;
+    }
+  }
 }
 
 void DSMClient::RegisterThread() {
@@ -51,21 +81,47 @@ void DSMClient::RegisterThread() {
   for (int i = 0; i < define::kMaxCoro; ++i) {
     rbuf_[i].set_buffer(rdma_buffer_ + i * define::kPerCoroRdmaBuf);
   }
+  if (pending_wr_head_ == nullptr) {
+    pending_wr_head_ = new ibv_send_wr*[conf_.num_server](); 
+    pending_wr_tail_ = new ibv_send_wr*[conf_.num_server]();
+  }
 }
 
 void DSMClient::Read(char *buffer, GlobalAddress gaddr, size_t size,
                      bool signal, CoroContext *ctx) {
   increase_pending_event();
   if (ctx == nullptr) {
+    // 非协程环境（同步调用），保持原样，直接发出
     rdmaRead(i_con_->data[0][gaddr.nodeID], (uint64_t)buffer,
              conn_to_server_[gaddr.nodeID].dsm_base + gaddr.offset, size,
              i_con_->cacheLKey, conn_to_server_[gaddr.nodeID].dsm_rkey[0],
              signal);
   } else {
-    rdmaRead(i_con_->data[0][gaddr.nodeID], (uint64_t)buffer,
-             conn_to_server_[gaddr.nodeID].dsm_base + gaddr.offset, size,
-             i_con_->cacheLKey, conn_to_server_[gaddr.nodeID].dsm_rkey[0], true,
-             ctx->coro_id);
+    // 协程环境：进入 Doorbell Batching 延迟发送路径
+    int coro_id = ctx->coro_id;
+    ibv_send_wr& wr = coro_wr_[coro_id];
+    ibv_sge& sg = coro_sge_[coro_id];
+
+    // 1. 填充 SG List
+    sg.addr = (uintptr_t)buffer;
+    sg.length = size;
+    sg.lkey = i_con_->cacheLKey;
+
+    // 2. 填充 Work Request
+    memset(&wr, 0, sizeof(wr));
+    wr.sg_list = &sg;
+    wr.num_sge = 1;
+    wr.opcode = IBV_WR_RDMA_READ;
+    
+    // 权衡点：目前每个协程依然需要自己的 CQE 来唤醒，所以保留 SIGNALED
+    if (signal) wr.send_flags = IBV_SEND_SIGNALED; 
+    
+    wr.wr.rdma.remote_addr = conn_to_server_[gaddr.nodeID].dsm_base + gaddr.offset;
+    wr.wr.rdma.rkey = conn_to_server_[gaddr.nodeID].dsm_rkey[0];
+    wr.wr_id = coro_id; // 让 CQE 携带正确的 coro_id 用于精确唤醒
+
+    // 3. 入队并让出 CPU
+    queue_wr(gaddr.nodeID, &wr);
     (*ctx->yield)(*ctx->master);
   }
 }
@@ -84,15 +140,46 @@ void DSMClient::Write(const char *buffer, GlobalAddress gaddr, size_t size,
                       bool signal, CoroContext *ctx) {
   increase_pending_event();
   if (ctx == nullptr) {
+    // 同步/非协程模式，保持原样，立即发出
     rdmaWrite(i_con_->data[0][gaddr.nodeID], (uint64_t)buffer,
               conn_to_server_[gaddr.nodeID].dsm_base + gaddr.offset, size,
               i_con_->cacheLKey, conn_to_server_[gaddr.nodeID].dsm_rkey[0], -1,
               signal);
   } else {
-    rdmaWrite(i_con_->data[0][gaddr.nodeID], (uint64_t)buffer,
-              conn_to_server_[gaddr.nodeID].dsm_base + gaddr.offset, size,
-              i_con_->cacheLKey, conn_to_server_[gaddr.nodeID].dsm_rkey[0], -1,
-              true, ctx->coro_id);
+    // 协程模式：进入 Doorbell Batching 延迟发送路径
+    int coro_id = ctx->coro_id;
+    ibv_send_wr& wr = coro_wr_[coro_id];
+    ibv_sge& sg = coro_sge_[coro_id];
+
+    // 1. 填充 SG List
+    sg.addr = (uintptr_t)buffer;
+    sg.length = size;
+    sg.lkey = i_con_->cacheLKey;
+
+    // 2. 填充 Work Request
+    memset(&wr, 0, sizeof(wr));
+    wr.sg_list = &sg;
+    wr.num_sge = 1;
+    wr.opcode = IBV_WR_RDMA_WRITE;
+    
+    wr.send_flags = 0;
+    // 协程模式为了精确唤醒，默认需要 CQE (原代码强传了 true)
+    if (signal) {
+      wr.send_flags |= IBV_SEND_SIGNALED;
+    }
+    
+    // 【关键】：保留小包 Inline 优化，省去一次网卡 DMA 拉取数据的 PCIe 读事务！
+    // MAX_INLINE_DATA 通常在你的 Rdma.h 里定义，取决于网卡配置（通常是 64 或 256 字节）
+    if (size < MAX_INLINE_DATA) {
+      wr.send_flags |= IBV_SEND_INLINE;
+    }
+
+    wr.wr.rdma.remote_addr = conn_to_server_[gaddr.nodeID].dsm_base + gaddr.offset;
+    wr.wr.rdma.rkey = conn_to_server_[gaddr.nodeID].dsm_rkey[0];
+    wr.wr_id = coro_id; // 携带 coro_id 用于 pollOnce 唤醒
+
+    // 3. 挂入目标节点的门铃等待队列，并让出 CPU 控制权
+    queue_wr(gaddr.nodeID, &wr);
     (*ctx->yield)(*ctx->master);
   }
 }

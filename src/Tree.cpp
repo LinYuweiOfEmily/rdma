@@ -2261,7 +2261,7 @@ void Tree::coro_master(CoroYield &yield, int coro_cnt) {
   for (int i = 0; i < coro_cnt; ++i) {
     yield(worker[i]);
   }
-
+  dsm_client_->FlushDoorbell();
   uint64_t poll_total = 0;
   uint64_t poll_hit = 0;
   uint64_t total_poll_time_ns = 0;  // 累计轮询时间（纳秒）
@@ -2343,6 +2343,7 @@ void Tree::coro_master(CoroYield &yield, int coro_cnt) {
       for (int i = 0; i < n; ++i) {
         yield(worker[ready_coros[i]]);
       }
+      dsm_client_->FlushDoorbell();
     } else {
       // 核心优化 4：微架构级暂停 (Micro-architectural Pause)
       // 当网卡真的没数据时，不要疯狂 while(true) 空转抢占 CPU 发热
