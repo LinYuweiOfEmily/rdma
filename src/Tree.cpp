@@ -13,12 +13,12 @@
 #include "Timer.h"
 #include "Common.h"
 
-// #define USE_AP
+#define USE_AP
 #define USE_SX_LOCK
 #define BATCH_LOCK_READ
 #define FINE_GRAINED_LEAF_NODE
 #define FINE_GRAINED_INTERNAL_NODE
-#define USE_BATCH_POLL
+// #define USE_BATCH_POLL
 // #define ENABLE_STATS
 // #define USE_CRC
 // #define USE_LOCAL_LOCK
@@ -38,10 +38,40 @@ thread_local uint64_t total_cmp = 0;
 thread_local uint64_t total_seek = 0;
 
 // 统计变量
-uint64_t tries_per_lock[MAX_APP_THREAD][5001];       // 单次拿锁最大尝试次数
+uint64_t tries_per_lock[MAX_APP_THREAD][5001];  
+uint64_t lock_rdma_faa_cnt[MAX_APP_THREAD] = {0};  // 用于拿票/退票的 Faa 次数
+uint64_t lock_rdma_read_cnt[MAX_APP_THREAD] = {0}; // 用于自旋等锁的 Read 次数     // 单次拿锁最大尝试次数
+
+// ================= 微基准测试开关 =================
+// #define ENABLE_MICROBENCH 1
+constexpr uint64_t MICROBENCH_MEM_LIMIT = 62ull * define::GB; // 在服务端的 1GB 范围内随机读
+// ==================================================
 
 
+// ---------------- 操作级 RDMA 统计 ----------------
+// 0: 未追踪 (如后台任务), 1: 追踪 Insert, 2: 追踪 Search
+thread_local int tracking_mode = 0; 
 
+// Insert 统计
+uint64_t insert_rtt_cnt[MAX_APP_THREAD][8] = {0};  
+uint64_t insert_byte_cnt[MAX_APP_THREAD][8] = {0}; 
+uint64_t insert_op_cnt[MAX_APP_THREAD][8] = {0};   
+
+// Search 统计
+uint64_t search_rtt_cnt[MAX_APP_THREAD][8] = {0};  
+uint64_t search_byte_cnt[MAX_APP_THREAD][8] = {0}; 
+uint64_t search_op_cnt[MAX_APP_THREAD][8] = {0};   
+
+inline void track_rdma(uint16_t tid, uint64_t rtt, uint64_t bytes) {
+  if (tracking_mode == 1) {
+    insert_rtt_cnt[tid][0] += rtt;
+    insert_byte_cnt[tid][0] += bytes;
+  } else if (tracking_mode == 2) {
+    search_rtt_cnt[tid][0] += rtt;
+    search_byte_cnt[tid][0] += bytes;
+  }
+}
+// ----------------------------------------------------
 
 StatHelper stat_helper;
 
@@ -327,8 +357,56 @@ void Tree::print_lock_stats() {
     #endif
     double avg = double(total_cmp) / total_seek;
     printf("Average compares per seek: %.3f\n", avg);
+    // 【新增】聚合全网锁 RDMA 统计
+    uint64_t total_lock_faa = 0;
+    uint64_t total_lock_read = 0;
+    for (int t = 0; t < MAX_APP_THREAD; ++t) {
+        total_lock_faa += lock_rdma_faa_cnt[t];
+        total_lock_read += lock_rdma_read_cnt[t];
+    }
+    uint64_t total_lock_rdma = total_lock_faa + total_lock_read;
 
+    printf("\n=== Lock RDMA Overhead Stats ===\n");
+    printf("  Total Lock FAA ops (Acquire/Release): %llu\n", (unsigned long long)total_lock_faa);
+    printf("  Total Lock Spin READ ops (Retries):   %llu\n", (unsigned long long)total_lock_read);
+    printf("  Total RDMA ops wasted on Locks:       %llu\n", (unsigned long long)total_lock_rdma);
+    
+    // 如果你有统计总的 operations 或者有用的 RDMA 次数，可以在这里算个占比
+    // 比如：double overhead_ratio = (double)total_lock_rdma / (total_lock_rdma + valid_rdma_ops);
+    printf("================================\n");
+  uint64_t total_insert_rtt = 0, total_insert_bytes = 0, total_insert_ops = 0;
+  uint64_t total_search_rtt = 0, total_search_bytes = 0, total_search_ops = 0;
+
+  for (int t = 0; t < MAX_APP_THREAD; ++t) {
+    total_insert_rtt += insert_rtt_cnt[t][0];
+    total_insert_bytes += insert_byte_cnt[t][0];
+    total_insert_ops += insert_op_cnt[t][0];
+
+    total_search_rtt += search_rtt_cnt[t][0];
+    total_search_bytes += search_byte_cnt[t][0];
+    total_search_ops += search_op_cnt[t][0];
+  }
+
+  printf("\n=== Operation RDMA Profiling ===\n");
+  if (total_insert_ops > 0) {
+    double avg_ins_rtt = (double)total_insert_rtt / total_insert_ops;
+    double avg_ins_bytes = (double)total_insert_bytes / total_insert_ops;
+    printf("[INSERT] Total Ops: %llu | Avg RTT: %.2f | Avg Data: %.2f Bytes\n", 
+           (unsigned long long)total_insert_ops, avg_ins_rtt, avg_ins_bytes);
+  }
+
+  if (total_search_ops > 0) {
+    double avg_sch_rtt = (double)total_search_rtt / total_search_ops;
+    double avg_sch_bytes = (double)total_search_bytes / total_search_ops;
+    printf("[SEARCH] Total Ops: %llu | Avg RTT: %.2f | Avg Data: %.2f Bytes\n", 
+           (unsigned long long)total_search_ops, avg_sch_rtt, avg_sch_bytes);
+  }
+  printf("================================\n");
 }
+
+
+
+
 
 inline void Tree::unlock_addr(GlobalAddress lock_addr, uint64_t *buf,
                               CoroContext *ctx, bool async) {
@@ -367,7 +445,8 @@ inline void Tree::acquire_sx_lock(GlobalAddress lock_addr,
 
   dsm_client_->FaaDmBoundSync(lock_addr, 3, add_val, lock_buffer,
                               XS_LOCK_FAA_MASK, ctx);
-  u_int16_t my_thread_id = dsm_client_->get_my_thread_id();                        
+  u_int16_t my_thread_id = dsm_client_->get_my_thread_id();  
+  lock_rdma_faa_cnt[my_thread_id]++;  // 【新增】记录 1 次加锁 FAA 报文                      
   uint16_t s_tic = *lock_buffer & 0xffff;
   uint16_t s_cnt = (*lock_buffer >> 16) & 0xffff;
   uint16_t x_tic = (*lock_buffer >> 32) & 0xffff;
@@ -400,6 +479,7 @@ retry:
       exit(-1);
     }
     dsm_client_->ReadDmSync((char *)lock_buffer, lock_addr, 8, ctx);
+    lock_rdma_read_cnt[my_thread_id]++; // 【新增】记录 1 次等锁的 Read 报文
     s_cnt = (*lock_buffer >> 16) & 0xffff;
     x_cnt = (*lock_buffer >> 48) & 0xffff;
     goto retry;
@@ -418,7 +498,11 @@ inline void Tree::release_sx_lock(GlobalAddress lock_addr,
   } else {
     dsm_client_->FaaDmBoundSync(lock_addr, 3, add_val, lock_buffer,
                                 XS_LOCK_FAA_MASK, ctx);
+    track_rdma(dsm_client_->get_my_thread_id(), 1, 8);
   }
+
+  // 【新增】记录 1 次解锁 FAA 报文
+  lock_rdma_faa_cnt[dsm_client_->get_my_thread_id()]++;
 }
 
 inline void Tree::acquire_lock(GlobalAddress lock_addr, uint64_t *lock_buffer,
@@ -478,6 +562,7 @@ void Tree::write_and_unlock(char *write_buffer, GlobalAddress write_addr,
 
 #ifdef USE_SX_LOCK
   dsm_client_->Write(write_buffer, write_addr, write_size, false);
+  track_rdma(dsm_client_->get_my_thread_id(), 1, write_size);
   release_sx_lock(lock_addr, cas_buffer, ctx, async, sx_lock);
 #else
 
@@ -528,6 +613,7 @@ void Tree::cas_and_unlock(GlobalAddress cas_addr, int log_cas_size,
 #ifdef USE_SX_LOCK
   dsm_client_->CasMask(cas_addr, log_cas_size, equal, swap, cas_buffer, mask,
                        false);
+  track_rdma(dsm_client_->get_my_thread_id(), 1, (1 << log_cas_size)); // log_cas_size 3为8B, 4为16B
   release_sx_lock(lock_addr, lock_buffer, ctx, async, share_lock);
 #else  // not USE_SX_LOCK
 
@@ -584,8 +670,11 @@ void Tree::lock_and_read(GlobalAddress lock_addr, bool share_lock,
   }
   dsm_client_->FaaDmBound(lock_addr, 3, add_val, lock_buffer, XS_LOCK_FAA_MASK,
                           false);
-  dsm_client_->ReadSync(read_buffer, read_addr, read_size, ctx);
+  lock_rdma_faa_cnt[my_thread_id]++; // 【新增】记录 1 次批量操作中的加锁 FAA
+  track_rdma(my_thread_id, 1, 8); // FAA 请求 8 字节
 
+  dsm_client_->ReadSync(read_buffer, read_addr, read_size, ctx);
+  track_rdma(my_thread_id, 1, read_size); // 读数据
   uint16_t s_tic = *lock_buffer & 0xffff;
   uint16_t s_cnt = (*lock_buffer >> 16) & 0xffff;
   uint16_t x_tic = (*lock_buffer >> 32) & 0xffff;
@@ -622,8 +711,11 @@ retry:
     }
 
     dsm_client_->ReadDm((char *)lock_buffer, lock_addr, 8, false);
-    dsm_client_->ReadSync(read_buffer, read_addr, read_size, ctx);
+    lock_rdma_read_cnt[my_thread_id]++; // 【新增】记录批量操作中等锁的 Read
+    track_rdma(my_thread_id, 1, 8); // 等锁的 Read 8 字节
 
+    dsm_client_->ReadSync(read_buffer, read_addr, read_size, ctx);
+    track_rdma(my_thread_id, 1, read_size); // 等锁时被浪费的数据 Read
     s_cnt = (*lock_buffer >> 16) & 0xffff;
     x_cnt = (*lock_buffer >> 48) & 0xffff;
     goto retry;
@@ -1142,12 +1234,15 @@ re_read:
   if (has_header) {
     dsm_client_->Read(page_buffer + bucket_offset,
                       GADD(page_addr, bucket_offset), kReadBucketSize, false);
+    track_rdma(dsm_client_->get_my_thread_id(), 1, kReadBucketSize); // 📝【埋点：异步读 Bucket】
     // read header
     dsm_client_->ReadSync(page_buffer + header_offset,
                           GADD(page_addr, header_offset), sizeof(Header), ctx);
+    track_rdma(dsm_client_->get_my_thread_id(), 1, sizeof(Header));  // 📝【埋点：同步读 Header】          
   } else {
     dsm_client_->ReadSync(page_buffer + bucket_offset,
                           GADD(page_addr, bucket_offset), kReadBucketSize, ctx);
+    track_rdma(dsm_client_->get_my_thread_id(), 1, kReadBucketSize); // 📝【埋点：同步读 Bucket】
   }
 
   result.clear();
@@ -1177,6 +1272,7 @@ re_read:
       dsm_client_->ReadSync(page_buffer + header_offset,
                             GADD(page_addr, header_offset), sizeof(Header),
                             ctx);
+      track_rdma(dsm_client_->get_my_thread_id(), 1, sizeof(Header)); // 📝【埋点：回源读 Header】
     }
     if (k >= hdr->highest || k < hdr->lowest) {
       // cache is stale
@@ -1221,6 +1317,7 @@ re_read:
     has_header = true;
     dsm_client_->ReadSync(page_buffer, page_addr,
                           std::max(kInternalPageSize, kLeafPageSize), ctx);
+    track_rdma(dsm_client_->get_my_thread_id(), 1, std::max(kInternalPageSize, kLeafPageSize));                      
     size_t start_offset =
         offsetof(InternalPage, records) - sizeof(InternalEntry);
     internal_read_cnt = kInternalCardinality + 1;
@@ -1270,6 +1367,7 @@ re_read:
                           GADD(page_addr, start_offset),
                           internal_read_cnt * sizeof(InternalEntry), ctx);
     guard = reinterpret_cast<InternalEntry *>(page_buffer + start_offset);
+    track_rdma(dsm_client_->get_my_thread_id(), 1, internal_read_cnt * sizeof(InternalEntry));
     assert(level_hint != 0);
     result.is_leaf = false;
     result.level = level_hint;
@@ -1754,7 +1852,7 @@ void Tree::internal_page_store_update_left_child(GlobalAddress page_addr,
     } else {
       dsm_client_->WriteSync(sibling_buf, sibling_addr, kInternalPageSize, ctx);
     }
-
+    
     write_and_unlock(page_buffer, page_addr, kInternalPageSize, lock_buffer,
                      lock_addr, ctx, true, false);
     if (root == page_addr) {
@@ -2088,7 +2186,7 @@ retry_insert_2:
   } else {
     dsm_client_->WriteSync(sibling_buf, sibling_addr, kLeafPageSize, ctx);
   }
-
+  track_rdma(dsm_client_->get_my_thread_id(), 1, kLeafPageSize); // 记录写新 Page 报文
   if (root == page_addr) {
     page->hdr.is_root = false;
   }
@@ -2231,16 +2329,32 @@ void Tree::coro_worker(CoroYield &yield, RequstGen *gen, int coro_id,
 
     coro_timer.begin();
     ++coro_ops_cnt_start;
+#ifdef ENABLE_MICROBENCH
+    // ==========================================
+    // 物理极限压测：绕过 B+ 树，直接敲底层网卡！
+    // ==========================================
+    this->microbench_op(&ctx, coro_id, r.is_search, r.k);
+#else
+
     if (lock_bench) {
       this->lock_bench(r.k, &ctx, coro_id);
     } else {
       if (r.is_search) {
         Value v;
+        tracking_mode = 2; // 【新增】：进入 Search 追踪模式
         this->search(r.k, v, &ctx);
+        tracking_mode = 0; // 退出追踪
+        
+        search_op_cnt[thread_id][0]++; // 记录一次完成的 Search
       } else {
+        tracking_mode = 1; // 【新增】：进入 Insert 追踪模式
         this->insert(r.k, r.v, &ctx);
+        tracking_mode = 0; // 退出追踪
+        
+        insert_op_cnt[thread_id][0]++; // 记录一次完成的 Insert
       }
     }
+#endif
     auto t = coro_timer.end();
     auto us_10 = t / 100;
     if (us_10 >= LATENCY_WINDOWS) {
@@ -2261,7 +2375,9 @@ void Tree::coro_master(CoroYield &yield, int coro_cnt) {
   for (int i = 0; i < coro_cnt; ++i) {
     yield(worker[i]);
   }
+#ifdef USE_DOORBELL_BATCHING
   dsm_client_->FlushDoorbell();
+#endif
   uint64_t poll_total = 0;
   uint64_t poll_hit = 0;
   uint64_t total_poll_time_ns = 0;  // 累计轮询时间（纳秒）
@@ -2269,14 +2385,16 @@ void Tree::coro_master(CoroYield &yield, int coro_cnt) {
   // 配置参数
   int spin_gap = 8;           // 初始比较小
   const int SPIN_MIN = 1;
-  // const int SPIN_MAX = 4096;  // 上限调大，因为负载可能非常低
   const int MISS_THRESHOLD = 16; // 超过这个 miss 次数就进入事件驱动
+  
+  // 核心融合 1：引入批量大小定义与就绪数组
+  const int BATCH_CQ_SIZE = 16;
+  uint64_t ready_coros[BATCH_CQ_SIZE];
 
   int idle_counter = 0;
   int miss_counter = 0;
 
   while (coro_ops_cnt_finish < coro_ops_total) {
-    uint64_t next_coro_id;
     while (dsm_client_->get_pending_event_count() == 0) {}
     if (++idle_counter < spin_gap) {
       _mm_pause();
@@ -2285,21 +2403,33 @@ void Tree::coro_master(CoroYield &yield, int coro_cnt) {
     idle_counter = 0;
 
     ++poll_total;
-    if (dsm_client_->PollRdmaCqOnce(next_coro_id)) {
-      ++poll_hit;
+    
+    // 核心融合 2：使用 PollRdmaCqBatch 替换 PollRdmaCqOnce
+    int n = dsm_client_->PollRdmaCqBatch(BATCH_CQ_SIZE, ready_coros);
+    
+    if (n > 0) {
+      poll_hit += n;
       miss_counter = 0;
 
-      yield(worker[next_coro_id]);
+      // 核心融合 3：集中唤醒所有就绪的工作协程
+      for (int i = 0; i < n; ++i) {
+        yield(worker[ready_coros[i]]);
+        // 每次唤醒协程处理完后，对应扣减一个 pending event
+        dsm_client_->decrease_pending_event(); 
+      }
       
-      // 命中 → 乘法减小
-      dsm_client_->decrease_pending_event();
+#ifdef USE_DOORBELL_BATCHING
+      // 核心融合 4：循环结束后，统一 Flush 门铃，将刚才积压的多个 RDMA 请求一次性打入网卡！
+      dsm_client_->FlushDoorbell();
+#endif
+
+      // 命中 → 乘法减小自旋间隔
       spin_gap >>= 1;
       if (spin_gap < SPIN_MIN) spin_gap = SPIN_MIN;
 
     } else {
       // 未命中 → 线性增加
       spin_gap += 8;
-      // if (spin_gap > SPIN_MAX) spin_gap = SPIN_MAX;
 
       ++miss_counter;
       if (miss_counter > MISS_THRESHOLD) {
@@ -2311,11 +2441,19 @@ void Tree::coro_master(CoroYield &yield, int coro_cnt) {
           ibv_ack_cq_events(ev_cq, 1);
           ibv_req_notify_cq(ev_cq, 0);
 
-          // 醒来后立刻 poll 一次
-          if (dsm_client_->PollRdmaCqOnce(next_coro_id)) {
-            ++poll_hit;
-            yield(worker[next_coro_id]);
-            dsm_client_->decrease_pending_event();
+          // 醒来后同样尝试批量 poll 一次
+          int ev_n = dsm_client_->PollRdmaCqBatch(BATCH_CQ_SIZE, ready_coros);
+          if (ev_n > 0) {
+            poll_hit += ev_n;
+            for (int i = 0; i < ev_n; ++i) {
+              yield(worker[ready_coros[i]]);
+              dsm_client_->decrease_pending_event();
+            }
+            
+#ifdef USE_DOORBELL_BATCHING
+            // 事件驱动模式下批量唤醒后，统一 Flush 门铃
+            dsm_client_->FlushDoorbell();
+#endif
           }
         }
         // 回到短 spin 模式
@@ -2343,7 +2481,9 @@ void Tree::coro_master(CoroYield &yield, int coro_cnt) {
       for (int i = 0; i < n; ++i) {
         yield(worker[ready_coros[i]]);
       }
+#ifdef USE_DOORBELL_BATCHING
       dsm_client_->FlushDoorbell();
+#endif
     } else {
       // 核心优化 4：微架构级暂停 (Micro-architectural Pause)
       // 当网卡真的没数据时，不要疯狂 while(true) 空转抢占 CPU 发热
@@ -2456,5 +2596,27 @@ void Tree::clear_statistics() {
   for (int i = 0; i < MAX_APP_THREAD; ++i) {
     cache_hit[i][0] = 0;
     cache_miss[i][0] = 0;
+  }
+}
+void Tree::microbench_op(CoroContext *ctx, int coro_id, bool is_search, Key k) {
+  auto &rbuf = dsm_client_->get_rbuf(coro_id);
+  char *page_buffer = rbuf.get_page_buffer();
+
+  GlobalAddress target_addr;
+  target_addr.nodeID = k % dsm_client_->get_server_size(); 
+  
+  if (is_search) {
+    uint64_t max_buckets = MICROBENCH_MEM_LIMIT / kReadBucketSize;
+    target_addr.offset = (k % max_buckets) * kReadBucketSize;
+    
+    // 【必须用 ReadSync】：发请求 -> 挂起当前协程 -> 等待网卡回执 -> 唤醒
+    dsm_client_->ReadSync(page_buffer, target_addr, kReadBucketSize, ctx);
+  } else {
+    // 【改成细粒度 16B 写】：测试网卡极致小包写入性能！
+    uint64_t max_entries = MICROBENCH_MEM_LIMIT / sizeof(LeafEntry);
+    target_addr.offset = (k % max_entries) * sizeof(LeafEntry);
+    
+    // 【必须用 WriteSync】：发请求 -> 挂起当前协程 -> 等待网卡回执 -> 唤醒
+    dsm_client_->WriteSync(page_buffer, target_addr, sizeof(LeafEntry), ctx);
   }
 }

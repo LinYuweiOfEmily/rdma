@@ -725,4 +725,5 @@ class Tree {
                           int coro_id);
   bool can_hand_over(GlobalAddress lock_addr);
   void releases_local_lock(GlobalAddress lock_addr);
+  void microbench_op(CoroContext *ctx, int coro_id, bool is_search, Key k);
 };

@@ -15,7 +15,6 @@
 #include <gperftools/profiler.h>
 
 //////////////////// workload parameters /////////////////////
-
 #define USE_CORO
 const int kCoroCnt = define::kCoroCnt;
 
@@ -273,12 +272,16 @@ void thread_run(int id) {
   // Timer total_timer;
   tree->run_coroutine(coro_func, id, kCoroCnt, lock_bench, NUM_WARMUP_OPS);
   // 启动 CPU Profiler (保存到当前目录的 perf.prof 文件)
-  ProfilerStart("perf.prof");
+  if (id == 0) {
+    ProfilerStart("perf.prof");
+  }
   total_timer.begin();
   tree->run_coroutine(coro_func, id, kCoroCnt, lock_bench,
                       FLAGS_ops_per_thread);
   // 结束性能分析
-  ProfilerStop();
+  if (id == 0) {
+    ProfilerStop();
+  }
   total_time[id][0] = total_timer.end();
 
 #else
@@ -376,12 +379,12 @@ int main(int argc, char *argv[]) {
   tree = new Tree(dsm_client);
 
 #ifndef BENCH_LOCK
-  if (dsm_client->get_my_client_id() == 0) {
-    tree->insert(to_key(0), 1);
-    for (uint64_t i = 1; i < 1000000; ++i) {
-      tree->insert(to_key(i), i * 2);
-    }
-  }
+  // if (dsm_client->get_my_client_id() == 0) {
+  //   tree->insert(to_key(0), 1);
+  //   for (uint64_t i = 1; i < 1000000; ++i) {
+  //     tree->insert(to_key(i), i * 2);
+  //   }
+  // }
 #endif
 
   dsm_client->Barrier("benchmark");

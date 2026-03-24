@@ -21,8 +21,10 @@
 
 // #define CONFIG_ENABLE_EMBEDDING_LOCK
 // #define CONFIG_ENABLE_CRC
+#define USE_DOORBELL_BATCHING
 
 #define KEY_SIZE 8
+
 
 #define LATENCY_WINDOWS 1000000
 #define MAX_TRIES_PER_LOCK 5000000
@@ -99,8 +101,8 @@ constexpr uint64_t kNumOfLock = kLockChipMemSize / kLockSize;
 // level of tree
 constexpr uint64_t kMaxLevelOfTree = 7;
 
-constexpr uint16_t kMaxCoro = 16;
-constexpr uint16_t kCoroCnt = 16;
+constexpr uint16_t kMaxCoro = 8;
+constexpr uint16_t kCoroCnt = 3;
 constexpr int64_t kPerThreadRdmaBuf  = 12 * MB;
 constexpr int64_t kPerCoroRdmaBuf = kPerThreadRdmaBuf / kMaxCoro;
 

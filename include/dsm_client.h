@@ -23,7 +23,9 @@ class DSMClient {
 
   // clear the network resources for all threads
   void ResetThread() { app_id_.store(0); }
+#ifdef USE_DOORBELL_BATCHING
   void FlushDoorbell();
+#endif
   // obtain netowrk resources for a thread
   void RegisterThread();
   bool IsRegistered() { return thread_id_ != -1; }
@@ -208,18 +210,37 @@ class DSMClient {
   std::atomic_int app_id_;
   Cache cache_;
   uint32_t my_client_id_;
+#ifdef USE_DOORBELL_BATCHING
   // 【新增】为每个协程预分配持久化的 WR 和 SGE 结构
   // 保证协程 yield 期间，网卡 DMA 读取这些结构时内存依然合法
+  // 提示：为了安全起见，建议这里的数组大小使用 define::kMaxCoro，与底下的 rbuf_ 保持对齐
   static thread_local ibv_send_wr coro_wr_[define::kCoroCnt];
   static thread_local ibv_sge coro_sge_[define::kCoroCnt];
   
   // 【新增】按目标 NodeID 划分的挂起队列（头尾指针），支持 $O(1)$ 尾部插入
-  static thread_local ibv_send_wr** pending_wr_head_; // 根据实际情况替换宏
+  static thread_local ibv_send_wr** pending_wr_head_; 
   static thread_local ibv_send_wr** pending_wr_tail_;
 
   // 内部辅助函数：将协程的 WR 挂载到对应目标节点的延迟队列中
   void queue_wr(int node_id, ibv_send_wr* wr);
 
+  // --- 【新增】实验性 Verbs 队列 (用于 CasMask, FaaBound 等) ---
+  static thread_local ibv_exp_send_wr coro_exp_wr_[define::kCoroCnt];
+  static thread_local ibv_sge coro_exp_sge_[define::kCoroCnt];
+  static thread_local ibv_exp_send_wr** pending_exp_wr_head_;
+  static thread_local ibv_exp_send_wr** pending_exp_wr_tail_;
+
+  inline void queue_exp_wr(int node_id, ibv_exp_send_wr* wr) {
+    wr->next = nullptr;
+    if (pending_exp_wr_head_[node_id] == nullptr) {
+      pending_exp_wr_head_[node_id] = wr;
+      pending_exp_wr_tail_[node_id] = wr;
+    } else {
+      pending_exp_wr_tail_[node_id]->next = wr;
+      pending_exp_wr_tail_[node_id] = wr;
+    }
+  }
+#endif
   static thread_local int thread_id_;
   static thread_local ThreadConnection *i_con_;
   static thread_local char *rdma_buffer_;
