@@ -404,17 +404,29 @@ class InternalPage {
 // LeafEntry Group in leaf page
 
 constexpr int kAssociativity = 4;
+#ifdef USE_LEAF_STASH
+constexpr int kGroupOverflowSlots = kAssociativity - 1;
+#else
+constexpr int kGroupOverflowSlots = kAssociativity;
+#endif
 constexpr int kNumBucket = 10;
 constexpr int kNumGroup = kNumBucket / 2;
-constexpr int kGroupSize = kAssociativity * 3;
-constexpr int kLeafCardinality = kNumGroup * kAssociativity * 3;
+#ifdef USE_LEAF_STASH
+constexpr int kLeafStashSlots =
+    kNumGroup * (kAssociativity - kGroupOverflowSlots);
+#else
+constexpr int kLeafStashSlots = 0;
+#endif
+constexpr int kGroupSize = kAssociativity * 2 + kGroupOverflowSlots;
+constexpr int kLeafCardinality = kNumGroup * kGroupSize + kLeafStashSlots;
+static_assert(kLeafCardinality == 60);
 
 static inline int key_hash_bucket(const Key &k) { return k % kNumBucket; }
 
 struct __attribute__((packed)) LeafEntryGroup {
   // 两个桶共享一个溢出桶
   LeafEntry front[kAssociativity];
-  LeafEntry overflow[kAssociativity];
+  LeafEntry overflow[kGroupOverflowSlots];
   LeafEntry back[kAssociativity];
 
   // 有一致性检查
@@ -469,7 +481,7 @@ struct __attribute__((packed)) LeafEntryGroup {
         }
       }
     }
-    for (int i = 0; i < kAssociativity; ++i) {
+    for (int i = 0; i < kGroupOverflowSlots; ++i) {
     #if ENABLE_STATS
             probe_counts++;
     #endif
@@ -505,7 +517,7 @@ struct __attribute__((packed)) LeafEntryGroup {
         }
       }
     }
-    for (int i = 0; i < kAssociativity; ++i) {
+    for (int i = 0; i < kGroupOverflowSlots; ++i) {
       if (overflow[i].key == k) {
         overflow[i].lv.val = v;
         return true;
@@ -540,7 +552,7 @@ struct __attribute__((packed)) LeafEntryGroup {
       }
     }
     // find overflow
-    for (int i = 0; i < kAssociativity; ++i) {
+    for (int i = 0; i < kGroupOverflowSlots; ++i) {
 #if ENABLE_STATS
             probe_counts++;
 #endif
@@ -559,7 +571,8 @@ struct __attribute__((packed)) LeafEntryGroup {
 };
 constexpr size_t kFrontOffset = 0;
 constexpr size_t kBackOffset = offsetof(LeafEntryGroup, overflow);
-constexpr size_t kReadBucketSize = sizeof(LeafEntry) * kAssociativity * 2;
+constexpr size_t kReadBucketSize =
+    sizeof(LeafEntry) * (kAssociativity + kGroupOverflowSlots);
 
 class LeafPage {
  private:
@@ -567,6 +580,7 @@ class LeafPage {
   Header hdr;
   // LeafEntry records[kLeafCardinality];
   LeafEntryGroup groups[kNumGroup];
+  LeafEntry stash[kLeafStashSlots];
 
   // uint8_t padding[1];
   // uint8_t rear_version;
@@ -576,6 +590,8 @@ class LeafPage {
  public:
   LeafPage(uint32_t level = 0) {
     hdr.level = level;
+    set_stash_group_mask(0);
+    set_stash_count(0);
     // records[0].value = kValueNull;
   }
 
@@ -592,8 +608,23 @@ class LeafPage {
     for (int i = 0; i < kNumGroup; ++i) {
       groups[i].set_version(hdr.version);
     }
+    for (int i = 0; i < kLeafStashSlots; ++i) {
+      stash[i].lv.cl_ver = hdr.version;
+    }
     return hdr.version;
   }
+  uint8_t stash_group_mask() const { return hdr.cache_read_gran[0]; }
+  void set_stash_group_mask(uint8_t mask) { hdr.cache_read_gran[0] = mask; }
+  uint8_t stash_count() const { return hdr.grp_in_cache[0]; }
+  void set_stash_count(uint8_t count) { hdr.grp_in_cache[0] = count; }
+  uint8_t version() const { return hdr.version; }
+  static constexpr size_t stash_group_mask_page_offset() {
+    return offsetof(LeafPage, hdr) + offsetof(Header, cache_read_gran);
+  }
+  LeafEntryGroup *group_at(int idx) { return &groups[idx]; }
+  const LeafEntryGroup *group_at(int idx) const { return &groups[idx]; }
+  LeafEntry *stash_entry(int idx) { return &stash[idx]; }
+  const LeafEntry *stash_entry(int idx) const { return &stash[idx]; }
   void debug() const {
     std::cout << "LeafPage@ ";
     hdr.debug();
@@ -621,6 +652,8 @@ class Tree {
   void index_cache_statistics();
   void clear_statistics();
   void print_lock_stats();
+  void set_prefill_split_stats(bool enabled);
+  void print_prefill_split_stats();
 
 
  private:

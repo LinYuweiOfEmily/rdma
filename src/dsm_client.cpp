@@ -112,7 +112,6 @@ void DSMClient::RegisterThread() {
 
 void DSMClient::Read(char *buffer, GlobalAddress gaddr, size_t size,
                      bool signal, CoroContext *ctx) {
-  increase_pending_event();
   if (ctx == nullptr) {
     // 非协程环境（同步调用），保持原样，直接发出
     rdmaRead(i_con_->data[0][gaddr.nodeID], (uint64_t)buffer,
@@ -120,6 +119,7 @@ void DSMClient::Read(char *buffer, GlobalAddress gaddr, size_t size,
              i_con_->cacheLKey, conn_to_server_[gaddr.nodeID].dsm_rkey[0],
              signal);
   } else {
+    increase_pending_event();
 #ifdef USE_DOORBELL_BATCHING
     // 协程环境：进入 Doorbell Batching 延迟发送路径
     int coro_id = ctx->coro_id;
@@ -168,7 +168,6 @@ void DSMClient::ReadSync(char *buffer, GlobalAddress gaddr, size_t size,
 
 void DSMClient::Write(const char *buffer, GlobalAddress gaddr, size_t size,
                       bool signal, CoroContext *ctx) {
-  increase_pending_event();
   if (ctx == nullptr) {
     // 同步/非协程模式，保持原样，立即发出
     rdmaWrite(i_con_->data[0][gaddr.nodeID], (uint64_t)buffer,
@@ -176,6 +175,7 @@ void DSMClient::Write(const char *buffer, GlobalAddress gaddr, size_t size,
               i_con_->cacheLKey, conn_to_server_[gaddr.nodeID].dsm_rkey[0], -1,
               signal);
   } else {
+    increase_pending_event();
 #ifdef USE_DOORBELL_BATCHING
     // 协程模式：进入 Doorbell Batching 延迟发送路径
     int coro_id = ctx->coro_id;
@@ -256,6 +256,7 @@ void DSMClient::ReadBatch(RdmaOpRegion *rs, int k, bool signal,
   if (ctx == nullptr) {
     rdmaReadBatch(i_con_->data[0][node_id], rs, k, signal);
   } else {
+    increase_pending_event();
     rdmaReadBatch(i_con_->data[0][node_id], rs, k, true, ctx->coro_id);
     (*ctx->yield)(*ctx->master);
   }
@@ -283,6 +284,7 @@ void DSMClient::WriteBatch(RdmaOpRegion *rs, int k, bool signal,
   if (ctx == nullptr) {
     rdmaWriteBatch(i_con_->data[0][node_id], rs, k, signal);
   } else {
+    increase_pending_event();
     rdmaWriteBatch(i_con_->data[0][node_id], rs, k, true, ctx->coro_id);
     (*ctx->yield)(*ctx->master);
   }
@@ -316,6 +318,7 @@ void DSMClient::WriteFaa(RdmaOpRegion &write_ror, RdmaOpRegion &faa_ror,
   if (ctx == nullptr) {
     rdmaWriteFaa(i_con_->data[0][node_id], write_ror, faa_ror, add_val, signal);
   } else {
+    increase_pending_event();
     rdmaWriteFaa(i_con_->data[0][node_id], write_ror, faa_ror, add_val, true,
                  ctx->coro_id);
     (*ctx->yield)(*ctx->master);
@@ -353,6 +356,7 @@ void DSMClient::WriteCas(RdmaOpRegion &write_ror, RdmaOpRegion &cas_ror,
     rdmaWriteCas(i_con_->data[0][node_id], write_ror, cas_ror, equal, val,
                  signal);
   } else {
+    increase_pending_event();
     rdmaWriteCas(i_con_->data[0][node_id], write_ror, cas_ror, equal, val, true,
                  ctx->coro_id);
     (*ctx->yield)(*ctx->master);
@@ -389,6 +393,7 @@ void DSMClient::CasRead(RdmaOpRegion &cas_ror, RdmaOpRegion &read_ror,
     rdmaCasRead(i_con_->data[0][node_id], cas_ror, read_ror, equal, val,
                 signal);
   } else {
+    increase_pending_event();
     rdmaCasRead(i_con_->data[0][node_id], cas_ror, read_ror, equal, val, true,
                 ctx->coro_id);
     (*ctx->yield)(*ctx->master);
@@ -426,6 +431,7 @@ void DSMClient::FaaRead(RdmaOpRegion &faa_ror, RdmaOpRegion &read_ror,
   if (ctx == nullptr) {
     rdmaFaaRead(i_con_->data[0][node_id], faa_ror, read_ror, add, signal);
   } else {
+    increase_pending_event();
     rdmaFaaRead(i_con_->data[0][node_id], faa_ror, read_ror, add, true,
                 ctx->coro_id);
     (*ctx->yield)(*ctx->master);
@@ -463,6 +469,7 @@ void DSMClient::FaaBoundRead(RdmaOpRegion &faab_ror, RdmaOpRegion &read_ror,
     rdmaFaaBoundRead(i_con_->data[0][node_id], faab_ror, read_ror, add,
                      boundary, signal);
   } else {
+    increase_pending_event();
     rdmaFaaBoundRead(i_con_->data[0][node_id], faab_ror, read_ror, add,
                      boundary, true, ctx->coro_id);
     (*ctx->yield)(*ctx->master);
@@ -490,6 +497,7 @@ void DSMClient::Cas(GlobalAddress gaddr, uint64_t equal, uint64_t val,
                        equal, val, i_con_->cacheLKey,
                        conn_to_server_[gaddr.nodeID].dsm_rkey[0], signal);
   } else {
+    increase_pending_event();
 #ifdef USE_DOORBELL_BATCHING
     int coro_id = ctx->coro_id;
     ibv_send_wr& wr = coro_wr_[coro_id];
@@ -548,6 +556,7 @@ void DSMClient::CasMask(GlobalAddress gaddr, int log_sz, uint64_t equal,
         val, i_con_->cacheLKey, conn_to_server_[gaddr.nodeID].dsm_rkey[0], mask,
         signal);
   } else {
+    increase_pending_event();
 #ifdef USE_DOORBELL_BATCHING
     int coro_id = ctx->coro_id;
     ibv_exp_send_wr& wr = coro_exp_wr_[coro_id]; // 【关键】使用 exp WR
@@ -635,6 +644,7 @@ void DSMClient::CasMaskWrite(RdmaOpRegion &cas_ror, uint64_t equal,
     rdmaCasMaskWrite(i_con_->data[0][node_id], cas_ror, equal, swap, mask,
                      write_ror, signal);
   } else {
+    increase_pending_event();
     rdmaCasMaskWrite(i_con_->data[0][node_id], cas_ror, equal, swap, mask,
                      write_ror, true, ctx->coro_id);
     (*ctx->yield)(*ctx->master);
@@ -675,6 +685,7 @@ void DSMClient::FaaBound(GlobalAddress gaddr, int log_sz, uint64_t add_val,
         i_con_->cacheLKey, conn_to_server_[gaddr.nodeID].dsm_rkey[0], mask,
         signal);
   } else {
+    increase_pending_event();
     rdmaFetchAndAddBoundary(
         i_con_->data[0][gaddr.nodeID], log_sz, (uint64_t)rdma_buffer,
         conn_to_server_[gaddr.nodeID].dsm_base + gaddr.offset, add_val,
@@ -704,6 +715,7 @@ void DSMClient::ReadDm(char *buffer, GlobalAddress gaddr, size_t size,
              i_con_->cacheLKey, conn_to_server_[gaddr.nodeID].lock_rkey[0],
              signal);
   } else {
+    increase_pending_event();
 #ifdef USE_DOORBELL_BATCHING
     int coro_id = ctx->coro_id;
     ibv_send_wr& wr = coro_wr_[coro_id];
@@ -756,6 +768,7 @@ void DSMClient::WriteDm(const char *buffer, GlobalAddress gaddr, size_t size,
               i_con_->cacheLKey, conn_to_server_[gaddr.nodeID].lock_rkey[0], -1,
               signal);
   } else {
+    increase_pending_event();
 #ifdef USE_DOORBELL_BATCHING
     int coro_id = ctx->coro_id;
     ibv_send_wr& wr = coro_wr_[coro_id];
@@ -810,6 +823,7 @@ void DSMClient::CasDm(GlobalAddress gaddr, uint64_t equal, uint64_t val,
                        equal, val, i_con_->cacheLKey,
                        conn_to_server_[gaddr.nodeID].lock_rkey[0], signal);
   } else {
+    increase_pending_event();
 #ifdef USE_DOORBELL_BATCHING
     int coro_id = ctx->coro_id;
     ibv_send_wr& wr = coro_wr_[coro_id];
@@ -867,6 +881,7 @@ void DSMClient::CasDmMask(GlobalAddress gaddr, int log_sz, uint64_t equal,
         val, i_con_->cacheLKey, conn_to_server_[gaddr.nodeID].lock_rkey[0],
         mask, signal);
   } else {
+    increase_pending_event();
     rdmaCompareAndSwapMask(
         i_con_->data[0][gaddr.nodeID], (uint64_t)rdma_buffer,
         conn_to_server_[gaddr.nodeID].lock_base + gaddr.offset, log_sz, equal,
@@ -910,6 +925,7 @@ void DSMClient::FaaDmBound(GlobalAddress gaddr, int log_sz, uint64_t add_val,
         i_con_->cacheLKey, conn_to_server_[gaddr.nodeID].lock_rkey[0], mask,
         signal);
   } else {
+    increase_pending_event();
     rdmaFetchAndAddBoundary(
         i_con_->data[0][gaddr.nodeID], log_sz, (uint64_t)rdma_buffer,
         conn_to_server_[gaddr.nodeID].lock_base + gaddr.offset, add_val,

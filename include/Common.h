@@ -21,7 +21,8 @@
 
 // #define CONFIG_ENABLE_EMBEDDING_LOCK
 // #define CONFIG_ENABLE_CRC
-#define USE_DOORBELL_BATCHING
+// #define USE_DOORBELL_BATCHING
+// #define USE_LEAF_STASH
 
 #define KEY_SIZE 8
 
@@ -102,7 +103,7 @@ constexpr uint64_t kNumOfLock = kLockChipMemSize / kLockSize;
 constexpr uint64_t kMaxLevelOfTree = 7;
 
 constexpr uint16_t kMaxCoro = 8;
-constexpr uint16_t kCoroCnt = 3;
+constexpr uint16_t kCoroCnt = 4;
 constexpr int64_t kPerThreadRdmaBuf  = 12 * MB;
 constexpr int64_t kPerCoroRdmaBuf = kPerThreadRdmaBuf / kMaxCoro;
 

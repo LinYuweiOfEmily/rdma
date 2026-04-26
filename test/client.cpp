@@ -244,6 +244,8 @@ void thread_run(int id) {
            (double)stat_lat[lat_write_page] / stat_cnt[lat_write_page]);
     // printf("avg crc latency: %.1lf\n",
     //        (double)stat_lat[lat_crc] / stat_cnt[lat_crc]);
+    tree->set_prefill_split_stats(false);
+    tree->print_prefill_split_stats();
     fflush(stdout);
 
     tree->index_cache_statistics();
@@ -391,6 +393,7 @@ int main(int argc, char *argv[]) {
 
   MAX_TOTAL_THREADS =
       std::max(FLAGS_num_prefill_threads, FLAGS_num_bench_threads);
+  tree->set_prefill_split_stats(true);
   for (int i = 1; i < MAX_TOTAL_THREADS; i++) {
     th[i] = std::thread(thread_run, i);
   }
