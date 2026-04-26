@@ -37,6 +37,10 @@ public:
 
   RdmaBuffer() = default;
 
+  static uintptr_t align_up(uintptr_t value, uintptr_t alignment) {
+    return (value + alignment - 1) / alignment * alignment;
+  }
+
   void set_buffer(char *buffer) {
 
     // printf("set buffer %p\n", buffer);
@@ -48,9 +52,9 @@ public:
         (uint64_t *)((char *)cas_buffer + 64 * kCasBufferCnt);
     zero_64bit = (uint64_t *)((char *)unlock_buffer + 64);
     // page_buffer = (char *)zero_64bit + sizeof(uint64_t);
-    page_buffer =
-        (char *)((uintptr_t)(zero_64bit + sizeof(uint64_t) + kPageSize - 1) &
-                 ~(uintptr_t)(kPageSize - 1));
+    page_buffer = (char *)align_up(reinterpret_cast<uintptr_t>(
+                                       zero_64bit + sizeof(uint64_t)),
+                                   define::kCacheLineSize);
     sibling_buffer = (char *)page_buffer + kPageSize * kPageBufferCnt;
     entry_buffer = (char *)sibling_buffer + kPageSize * kSiblingBufferCnt;
     *zero_64bit = 0;

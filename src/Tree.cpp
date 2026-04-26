@@ -51,6 +51,8 @@
   uint64_t optimistic_insert_split_abort_cnt[MAX_APP_THREAD] = {0};
   uint64_t optimistic_insert_consistency_fail_cnt[MAX_APP_THREAD] = {0};
   uint64_t optimistic_insert_fallback_cnt[MAX_APP_THREAD] = {0};
+  uint64_t leaf_group_reread_too_many_cnt[MAX_APP_THREAD] = {0};
+  uint64_t leaf_group_reread_fallback_cnt[MAX_APP_THREAD] = {0};
 
 // ================= Experiment Switches =================
 // Baseline recommendation:
@@ -304,6 +306,58 @@ inline bool insert_leaf_entry_for_rebuild(LeafPage *page, const Key &k,
 #endif
 }
 
+inline void refresh_leaf_group_meta(LeafPage *page, int group_id) {
+  page->refresh_group_meta(group_id);
+}
+
+inline void refresh_all_leaf_group_meta(LeafPage *page) {
+  page->refresh_all_group_meta();
+}
+
+inline void update_remote_leaf_group_meta_slot(DSMClient *dsm_client,
+                                               GlobalAddress page_addr,
+                                               LeafPage *page,
+                                               int group_id,
+                                               int slot,
+                                               const Key &k,
+                                               char *page_buffer,
+                                               CoroContext *ctx,
+                                               uint16_t tid) {
+  (void)page;
+  size_t meta_offset = LeafPage::group_meta_page_offset(group_id);
+  auto *meta = reinterpret_cast<LeafGroupMeta *>(page_buffer + meta_offset);
+  dsm_client->ReadSync(reinterpret_cast<char *>(meta),
+                       GADD(page_addr, meta_offset), sizeof(LeafGroupMeta),
+                       ctx);
+  track_rdma(tid, 1, sizeof(LeafGroupMeta));
+  meta->version = page_addr.node_version;
+  meta->set_slot(slot, k);
+  dsm_client->WriteSync(reinterpret_cast<char *>(meta),
+                        GADD(page_addr, meta_offset), sizeof(LeafGroupMeta),
+                        ctx);
+  track_rdma(tid, 1, sizeof(LeafGroupMeta));
+}
+
+inline void clear_remote_leaf_group_meta_slot(DSMClient *dsm_client,
+                                              GlobalAddress page_addr,
+                                              int group_id,
+                                              int slot,
+                                              char *page_buffer,
+                                              CoroContext *ctx,
+                                              uint16_t tid) {
+  size_t meta_offset = LeafPage::group_meta_page_offset(group_id);
+  auto *meta = reinterpret_cast<LeafGroupMeta *>(page_buffer + meta_offset);
+  dsm_client->ReadSync(reinterpret_cast<char *>(meta),
+                       GADD(page_addr, meta_offset), sizeof(LeafGroupMeta),
+                       ctx);
+  track_rdma(tid, 1, sizeof(LeafGroupMeta));
+  meta->clear_slot(slot);
+  dsm_client->WriteSync(reinterpret_cast<char *>(meta),
+                        GADD(page_addr, meta_offset), sizeof(LeafGroupMeta),
+                        ctx);
+  track_rdma(tid, 1, sizeof(LeafGroupMeta));
+}
+
 #ifdef USE_LEAF_STASH
 static_assert(LeafPage::stash_group_mask_page_offset() % sizeof(uint64_t) == 0,
               "leaf stash mask word must be 8-byte aligned");
@@ -476,6 +530,7 @@ inline void clear_hot_leaf_fast_path_conflict(GlobalAddress page_addr) {
     // try to init tree and install root pointer
     char *page_buffer = (dsm_client_->get_rbuf(0)).get_page_buffer();
     GlobalAddress root_addr = dsm_client_->Alloc(kLeafPageSize);
+    memset(page_buffer, 0, kLeafPageSize);
     [[maybe_unused]] LeafPage *root_page = new (page_buffer) LeafPage;
 
     dsm_client_->WriteSync(page_buffer, root_addr, kLeafPageSize);
@@ -766,6 +821,8 @@ inline void clear_hot_leaf_fast_path_conflict(GlobalAddress page_addr) {
     uint64_t total_optimistic_insert_split_abort = 0;
     uint64_t total_optimistic_insert_consistency_fail = 0;
     uint64_t total_optimistic_insert_fallback = 0;
+    uint64_t total_leaf_group_reread_too_many = 0;
+    uint64_t total_leaf_group_reread_fallback = 0;
 
     for (int t = 0; t < MAX_APP_THREAD; ++t) {
       total_insert_rtt += insert_rtt_cnt[t][0];
@@ -812,6 +869,8 @@ inline void clear_hot_leaf_fast_path_conflict(GlobalAddress page_addr) {
       total_optimistic_insert_consistency_fail +=
           optimistic_insert_consistency_fail_cnt[t];
       total_optimistic_insert_fallback += optimistic_insert_fallback_cnt[t];
+      total_leaf_group_reread_too_many += leaf_group_reread_too_many_cnt[t];
+      total_leaf_group_reread_fallback += leaf_group_reread_fallback_cnt[t];
     }
 
     printf("\n=== Operation RDMA Profiling ===\n");
@@ -942,6 +1001,12 @@ inline void clear_hot_leaf_fast_path_conflict(GlobalAddress page_addr) {
       printf("  Fallbacks:            %llu (%.4f / insert)\n",
             (unsigned long long)total_optimistic_insert_fallback,
             (double)total_optimistic_insert_fallback / total_insert_ops);
+      printf("  Leaf group reread too-many: %llu (%.6f / insert)\n",
+            (unsigned long long)total_leaf_group_reread_too_many,
+            (double)total_leaf_group_reread_too_many / total_insert_ops);
+      printf("  Leaf group reread fallbacks: %llu (%.6f / insert)\n",
+            (unsigned long long)total_leaf_group_reread_fallback,
+            (double)total_leaf_group_reread_fallback / total_insert_ops);
       printf("================================\n");
     }
     printf("================================\n");
@@ -1925,26 +1990,127 @@ void Tree::lock_and_read(GlobalAddress lock_addr, bool share_lock,
         group_offset + (bucket_id % 2 ? kBackOffset : kFrontOffset);
     bool has_header = false;
     int header_offset = offsetof(LeafPage, hdr);
+    uint16_t tid = dsm_client_->get_my_thread_id();
+
+    auto leaf_group_meta_search_fast_path = [&]() -> bool {
+      size_t meta_offset = LeafPage::group_meta_page_offset(group_id);
+      auto *meta = reinterpret_cast<LeafGroupMeta *>(page_buffer + meta_offset);
+      dsm_client_->ReadSync(reinterpret_cast<char *>(meta),
+                            GADD(page_addr, meta_offset),
+                            sizeof(LeafGroupMeta), ctx);
+      track_rdma(tid, 1, sizeof(LeafGroupMeta));
+      if (meta->version != page_addr.node_version) {
+        return false;
+      }
+
+      uint16_t fp = leaf_key_fingerprint(k);
+      auto try_slot = [&](int slot) -> bool {
+        if (!meta->occupied(slot) || meta->fp[slot] != fp) {
+          return false;
+        }
+        size_t entry_offset = LeafPage::group_slot_page_offset(group_id, slot);
+        dsm_client_->ReadSync(page_buffer + entry_offset,
+                              GADD(page_addr, entry_offset),
+                              sizeof(LeafEntry), ctx);
+        track_rdma(tid, 1, sizeof(LeafEntry));
+        auto *fast_entry =
+            reinterpret_cast<LeafEntry *>(page_buffer + entry_offset);
+        if (fast_entry->key == k && fast_entry->lv.val != kValueNull &&
+            fast_entry->lv.cl_ver == page_addr.node_version) {
+          result.clear();
+          result.is_leaf = true;
+          result.level = 0;
+          result.val = fast_entry->lv.val;
+          return true;
+        }
+        return false;
+      };
+
+      if (bucket_id % 2) {
+        for (int i = 0; i < kAssociativity; ++i) {
+          if (try_slot(kAssociativity + kGroupOverflowSlots + i)) {
+            return true;
+          }
+        }
+      } else {
+        for (int i = 0; i < kAssociativity; ++i) {
+          if (try_slot(i)) {
+            return true;
+          }
+        }
+      }
+      for (int i = 0; i < kGroupOverflowSlots; ++i) {
+        if (try_slot(kAssociativity + i)) {
+          return true;
+        }
+      }
+      return false;
+    };
+
+    auto fallback_full_leaf_search = [&]() -> bool {
+      leaf_group_reread_fallback_cnt[tid]++;
+      dsm_client_->ReadSync(page_buffer, page_addr, kLeafPageSize, ctx);
+      track_rdma(tid, 1, kLeafPageSize);
+
+      LeafPage *page = reinterpret_cast<LeafPage *>(page_buffer);
+      Header *full_hdr = &page->hdr;
+      result.clear();
+      result.is_leaf = true;
+      result.level = 0;
+
+      if (k >= full_hdr->highest) {
+        if (from_cache) {
+          return false;
+        }
+        result.sibling = full_hdr->sibling_ptr;
+        result.next_min = full_hdr->highest;
+        return true;
+      }
+      if (k < full_hdr->lowest) {
+        return !from_cache;
+      }
+
+      int fallback_bucket_id = key_hash_bucket(k);
+      int fallback_group_id = fallback_bucket_id / 2;
+      LeafEntryGroup *fallback_group = page->group_at(fallback_group_id);
+      bool found = fallback_group->find(k, result, !(fallback_bucket_id % 2));
+#ifdef USE_LEAF_STASH
+      if (!found && leaf_stash_may_have(page, fallback_group_id)) {
+        LeafEntry *stash_entry =
+            find_leaf_stash_entry(page, k, fallback_group_id);
+        if (stash_entry) {
+          result.val = stash_entry->lv.val;
+        }
+      }
+#endif
+      return true;
+    };
+
+    if (leaf_group_meta_search_fast_path()) {
+      return true;
+    }
 
     int read_counter = 0;
   re_read:
     if (++read_counter > 10) {
       printf("re-read (leaf_page_group) too many times\n");
-      sleep(1);
+      leaf_group_reread_too_many_cnt[tid]++;
+      mark_hot_leaf_fast_path_conflict(page_addr);
+      return fallback_full_leaf_search();
     }
 
     if (has_header) {
       dsm_client_->Read(page_buffer + bucket_offset,
                         GADD(page_addr, bucket_offset), kReadBucketSize, false);
-      track_rdma(dsm_client_->get_my_thread_id(), 1, kReadBucketSize); // 📝【埋点：异步读 Bucket】
+      track_rdma(tid, 1, kReadBucketSize); // 📝【埋点：异步读 Bucket】
       // read header
       dsm_client_->ReadSync(page_buffer + header_offset,
                             GADD(page_addr, header_offset), sizeof(Header), ctx);
-      track_rdma(dsm_client_->get_my_thread_id(), 1, sizeof(Header));  // 📝【埋点：同步读 Header】          
+      track_rdma(tid, 1, sizeof(Header));  // 📝【埋点：同步读 Header】          
     } else {
       dsm_client_->ReadSync(page_buffer + bucket_offset,
                             GADD(page_addr, bucket_offset), kReadBucketSize, ctx);
-      track_rdma(dsm_client_->get_my_thread_id(), 1, kReadBucketSize); // 📝【埋点：同步读 Bucket】
+      track_rdma(tid, 1, kReadBucketSize); // 📝【埋点：同步读 Bucket】
     }
 
     result.clear();
@@ -1975,7 +2141,7 @@ void Tree::lock_and_read(GlobalAddress lock_addr, bool share_lock,
           dsm_client_->ReadSync(page_buffer + header_offset,
                                 GADD(page_addr, header_offset), sizeof(Header),
                                 ctx);
-          track_rdma(dsm_client_->get_my_thread_id(), 1, sizeof(Header));
+          track_rdma(tid, 1, sizeof(Header));
           has_header = true;
         }
         if (k >= hdr->highest || k < hdr->lowest) {
@@ -1988,7 +2154,7 @@ void Tree::lock_and_read(GlobalAddress lock_addr, bool share_lock,
         dsm_client_->ReadSync(page_buffer + header_offset,
                               GADD(page_addr, header_offset), sizeof(Header),
                               ctx);
-        track_rdma(dsm_client_->get_my_thread_id(), 1, sizeof(Header));
+        track_rdma(tid, 1, sizeof(Header));
         has_header = true;
       }
       if (hdr->version != page_addr.node_version) {
@@ -2011,8 +2177,7 @@ void Tree::lock_and_read(GlobalAddress lock_addr, bool share_lock,
         dsm_client_->ReadSync(page_buffer + stash_offset,
                               GADD(page_addr, stash_offset),
                               sizeof(LeafEntry) * kLeafStashSlots, ctx);
-        track_rdma(dsm_client_->get_my_thread_id(), 1,
-                   sizeof(LeafEntry) * kLeafStashSlots);
+        track_rdma(tid, 1, sizeof(LeafEntry) * kLeafStashSlots);
         LeafEntry *stash_entry = find_leaf_stash_entry(page, k, group_id);
         if (stash_entry) {
           result.val = stash_entry->lv.val;
@@ -2684,6 +2849,79 @@ void Tree::lock_and_read(GlobalAddress lock_addr, bool share_lock,
       optimistic_leaf_fast_path_hot_bypass_cnt[tid]++;
     }
 
+    auto leaf_group_meta_update_fast_path = [&]() -> bool {
+      if (bypass_optimistic_leaf_fast_path) {
+        return false;
+      }
+      size_t meta_offset = LeafPage::group_meta_page_offset(group_id);
+      auto *meta = reinterpret_cast<LeafGroupMeta *>(page_buffer + meta_offset);
+      dsm_client_->ReadSync(reinterpret_cast<char *>(meta),
+                            GADD(page_addr, meta_offset),
+                            sizeof(LeafGroupMeta), ctx);
+      track_rdma(tid, 1, sizeof(LeafGroupMeta));
+      if (meta->version != page_addr.node_version) {
+        return false;
+      }
+
+      uint16_t fp = leaf_key_fingerprint(k);
+      auto try_slot = [&](int slot) -> bool {
+        if (!meta->occupied(slot) || meta->fp[slot] != fp) {
+          return false;
+        }
+        size_t entry_offset = LeafPage::group_slot_page_offset(group_id, slot);
+        dsm_client_->ReadSync(page_buffer + entry_offset,
+                              GADD(page_addr, entry_offset),
+                              sizeof(LeafEntry), ctx);
+        track_rdma(tid, 1, sizeof(LeafEntry));
+        auto *fast_entry =
+            reinterpret_cast<LeafEntry *>(page_buffer + entry_offset);
+        if (fast_entry->key != k || fast_entry->lv.val == kValueNull ||
+            fast_entry->lv.cl_ver != page_addr.node_version) {
+          return false;
+        }
+
+        optimistic_update_attempt_cnt[tid]++;
+        LeafValue cas_val(fast_entry->lv.cl_ver, v);
+        bool cas_ok = dsm_client_->CasSync(
+            GADD(page_addr, entry_offset + offsetof(LeafEntry, lv)),
+            fast_entry->lv.raw, cas_val.raw, cas_ret_buffer, ctx);
+        track_rdma(tid, 1, sizeof(LeafValue));
+        if (!cas_ok) {
+          optimistic_update_cas_fail_cnt[tid]++;
+          mark_hot_leaf_fast_path_conflict(page_addr);
+          return false;
+        }
+        clear_hot_leaf_fast_path_conflict(page_addr);
+        optimistic_update_success_cnt[tid]++;
+        leaf_update_hit_cnt[tid]++;
+        return true;
+      };
+
+      if (bucket_id % 2) {
+        for (int i = 0; i < kAssociativity; ++i) {
+          if (try_slot(kAssociativity + kGroupOverflowSlots + i)) {
+            return true;
+          }
+        }
+      } else {
+        for (int i = 0; i < kAssociativity; ++i) {
+          if (try_slot(i)) {
+            return true;
+          }
+        }
+      }
+      for (int i = 0; i < kGroupOverflowSlots; ++i) {
+        if (try_slot(kAssociativity + i)) {
+          return true;
+        }
+      }
+      return false;
+    };
+
+    if (leaf_group_meta_update_fast_path()) {
+      return true;
+    }
+
     for (int optimistic_retry = 0;
         !bypass_optimistic_leaf_fast_path &&
         optimistic_retry < kOptimisticUpdateRetry;
@@ -2695,6 +2933,7 @@ void Tree::lock_and_read(GlobalAddress lock_addr, bool share_lock,
       if (!group->check_consistency(!(bucket_id % 2), page_addr.node_version,
                                     actual_version)) {
         optimistic_insert_consistency_fail_cnt[tid]++;
+        mark_hot_leaf_fast_path_conflict(page_addr);
         if (from_cache) {
           return false;
         }
@@ -2730,6 +2969,15 @@ void Tree::lock_and_read(GlobalAddress lock_addr, bool share_lock,
           if (cas_ok || (__bswap_64(cas_ret_buffer[0]) == k)) {
             optimistic_insert_success_cnt[tid]++;
             leaf_insert_empty_cnt[tid]++;
+            insert_addr->key = k;
+            insert_addr->lv.cl_ver = swap_entry->lv.cl_ver;
+            insert_addr->lv.val = v;
+            int inserted_slot = group->slot_index(insert_addr);
+            if (inserted_slot >= 0) {
+              update_remote_leaf_group_meta_slot(
+                  dsm_client_, page_addr, reinterpret_cast<LeafPage *>(page_buffer),
+                  group_id, inserted_slot, k, page_buffer, ctx, tid);
+            }
             clear_hot_leaf_fast_path_conflict(page_addr);
             return true;
           }
@@ -2843,6 +3091,15 @@ void Tree::lock_and_read(GlobalAddress lock_addr, bool share_lock,
       // cas succeed or same key inserted by other thread
       if (cas_ok || (__bswap_64(cas_ret_buffer[0]) == k)) {
         leaf_insert_empty_cnt[tid]++;
+        insert_addr->key = k;
+        insert_addr->lv.cl_ver = swap_entry->lv.cl_ver;
+        insert_addr->lv.val = v;
+        int inserted_slot = group->slot_index(insert_addr);
+        if (inserted_slot >= 0) {
+          update_remote_leaf_group_meta_slot(
+              dsm_client_, page_addr, reinterpret_cast<LeafPage *>(page_buffer),
+              group_id, inserted_slot, k, page_buffer, ctx, tid);
+        }
         release_lock(lock_addr, lock_buffer, ctx, true, share_lock);
         return true;
       }
@@ -2987,6 +3244,15 @@ void Tree::lock_and_read(GlobalAddress lock_addr, bool share_lock,
       // cas succeed or same key inserted by other thread
       if (cas_ok || (__bswap_64(cas_ret_buffer[0]) == k)) {
         leaf_insert_empty_cnt[tid]++;
+        insert_addr->key = k;
+        insert_addr->lv.cl_ver = swap_entry->lv.cl_ver;
+        insert_addr->lv.val = v;
+        int inserted_slot = group->slot_index(insert_addr);
+        if (inserted_slot >= 0) {
+          update_remote_leaf_group_meta_slot(
+              dsm_client_, page_addr, page, group_id, inserted_slot, k,
+              page_buffer, ctx, tid);
+        }
         release_lock(lock_addr, lock_buffer, ctx, true, share_lock);
         return true;
       }
@@ -3054,9 +3320,11 @@ void Tree::lock_and_read(GlobalAddress lock_addr, bool share_lock,
 
     // split
     leaf_split_cnt[tid]++;
+    mark_hot_leaf_fast_path_conflict(page_addr);
     GlobalAddress sibling_addr;
     sibling_addr = dsm_client_->Alloc(kLeafPageSize);
     char *sibling_buf = rbuf.get_sibling_buffer();
+    memset(sibling_buf, 0, kLeafPageSize);
     LeafPage *sibling = new (sibling_buf) LeafPage(page->hdr.level);
 
     LeafKVEntry tmp_records[kLeafCardinality];
@@ -3160,6 +3428,9 @@ void Tree::lock_and_read(GlobalAddress lock_addr, bool share_lock,
     } else {
       res = insert_leaf_entry_for_rebuild(sibling, k, v);
     }
+    refresh_leaf_group_meta(page, group_id);
+    refresh_all_leaf_group_meta(page);
+    refresh_all_leaf_group_meta(sibling);
 
     if (sibling_addr.nodeID == page_addr.nodeID) {
       dsm_client_->Write(sibling_buf, sibling_addr, kLeafPageSize, false);
@@ -3645,6 +3916,8 @@ void Tree::lock_and_read(GlobalAddress lock_addr, bool share_lock,
       optimistic_insert_split_abort_cnt[i] = 0;
       optimistic_insert_consistency_fail_cnt[i] = 0;
       optimistic_insert_fallback_cnt[i] = 0;
+      leaf_group_reread_too_many_cnt[i] = 0;
+      leaf_group_reread_fallback_cnt[i] = 0;
       insert_rtt_cnt[i][0] = 0;
       insert_byte_cnt[i][0] = 0;
       insert_op_cnt[i][0] = 0;

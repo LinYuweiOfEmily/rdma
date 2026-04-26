@@ -169,8 +169,9 @@ constexpr size_t kHeaderSize = (kHeaderRawSize + 63) / 64 * 64;
 constexpr uint32_t kPageSize =
     (kHeaderSize + 60 * (sizeof(InternalKey) + sizeof(uint64_t)) + 63) / 64 *
     64;
+constexpr uint32_t kLeafFingerprintMetaBytes = 192;
 constexpr uint32_t kInternalPageSize = kPageSize;
-constexpr uint32_t kLeafPageSize = kPageSize;
+constexpr uint32_t kLeafPageSize = kPageSize + kLeafFingerprintMetaBytes;
 
 __inline__ unsigned long long rdtsc(void) {
   unsigned hi, lo;

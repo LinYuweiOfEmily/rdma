@@ -423,6 +423,40 @@ static_assert(kLeafCardinality == 60);
 
 static inline int key_hash_bucket(const Key &k) { return k % kNumBucket; }
 
+static inline uint16_t leaf_key_fingerprint(const Key &k) {
+  uint64_t h = CityHash64(reinterpret_cast<const char *>(&k), sizeof(Key));
+  uint16_t fp = static_cast<uint16_t>(h >> 48);
+  return fp == 0 ? 1 : fp;
+}
+
+struct __attribute__((packed)) LeafGroupMeta {
+  uint16_t fp[kGroupSize];
+  uint16_t occupied_bitmap;
+  uint8_t version;
+  uint8_t reserved[5];
+
+  LeafGroupMeta() { clear(); }
+
+  void clear() {
+    memset(this, 0, sizeof(*this));
+  }
+
+  bool occupied(int slot) const {
+    return (occupied_bitmap & static_cast<uint16_t>(1u << slot)) != 0;
+  }
+
+  void set_slot(int slot, const Key &k) {
+    fp[slot] = leaf_key_fingerprint(k);
+    occupied_bitmap |= static_cast<uint16_t>(1u << slot);
+  }
+
+  void clear_slot(int slot) {
+    fp[slot] = 0;
+    occupied_bitmap &= static_cast<uint16_t>(~(1u << slot));
+  }
+};
+static_assert(sizeof(LeafGroupMeta) == 32);
+
 struct __attribute__((packed)) LeafEntryGroup {
   // 两个桶共享一个溢出桶
   LeafEntry front[kAssociativity];
@@ -530,6 +564,45 @@ struct __attribute__((packed)) LeafEntryGroup {
     return false;
   }
 
+  LeafEntry *slot_at(int slot) {
+    if (slot < kAssociativity) {
+      return &front[slot];
+    }
+    if (slot < kAssociativity + kGroupOverflowSlots) {
+      return &overflow[slot - kAssociativity];
+    }
+    return &back[slot - kAssociativity - kGroupOverflowSlots];
+  }
+
+  const LeafEntry *slot_at(int slot) const {
+    if (slot < kAssociativity) {
+      return &front[slot];
+    }
+    if (slot < kAssociativity + kGroupOverflowSlots) {
+      return &overflow[slot - kAssociativity];
+    }
+    return &back[slot - kAssociativity - kGroupOverflowSlots];
+  }
+
+  int slot_index(const LeafEntry *entry) const {
+    for (int i = 0; i < kAssociativity; ++i) {
+      if (entry == &front[i]) {
+        return i;
+      }
+    }
+    for (int i = 0; i < kGroupOverflowSlots; ++i) {
+      if (entry == &overflow[i]) {
+        return kAssociativity + i;
+      }
+    }
+    for (int i = 0; i < kAssociativity; ++i) {
+      if (entry == &back[i]) {
+        return kAssociativity + kGroupOverflowSlots + i;
+      }
+    }
+    return -1;
+  }
+
   bool find(const Key &k, bool is_front, LeafEntry **entry_addr,
             LeafEntry **empty_addr) {
     // find main bucket
@@ -580,6 +653,7 @@ class LeafPage {
   Header hdr;
   // LeafEntry records[kLeafCardinality];
   LeafEntryGroup groups[kNumGroup];
+  LeafGroupMeta group_meta[kNumGroup];
   LeafEntry stash[kLeafStashSlots];
 
   // uint8_t padding[1];
@@ -618,8 +692,42 @@ class LeafPage {
   uint8_t stash_count() const { return hdr.grp_in_cache[0]; }
   void set_stash_count(uint8_t count) { hdr.grp_in_cache[0] = count; }
   uint8_t version() const { return hdr.version; }
+  LeafGroupMeta *group_meta_at(int idx) { return &group_meta[idx]; }
+  const LeafGroupMeta *group_meta_at(int idx) const { return &group_meta[idx]; }
+  void refresh_group_meta(int group_id) {
+    LeafGroupMeta *meta = group_meta_at(group_id);
+    meta->clear();
+    meta->version = hdr.version;
+    const LeafEntryGroup *group = group_at(group_id);
+    for (int slot = 0; slot < kGroupSize; ++slot) {
+      const LeafEntry *entry = group->slot_at(slot);
+      if (entry->lv.val != kValueNull) {
+        meta->set_slot(slot, entry->key);
+      }
+    }
+  }
+  void refresh_all_group_meta() {
+    for (int i = 0; i < kNumGroup; ++i) {
+      refresh_group_meta(i);
+    }
+  }
   static constexpr size_t stash_group_mask_page_offset() {
     return offsetof(LeafPage, hdr) + offsetof(Header, cache_read_gran);
+  }
+  static constexpr size_t group_meta_page_offset(int group_id) {
+    return offsetof(LeafPage, group_meta) + sizeof(LeafGroupMeta) * group_id;
+  }
+  static constexpr size_t group_slot_page_offset(int group_id, int slot) {
+    return offsetof(LeafPage, groups) + sizeof(LeafEntryGroup) * group_id +
+           (slot < kAssociativity
+                ? offsetof(LeafEntryGroup, front) + sizeof(LeafEntry) * slot
+                : (slot < kAssociativity + kGroupOverflowSlots
+                       ? offsetof(LeafEntryGroup, overflow) +
+                             sizeof(LeafEntry) * (slot - kAssociativity)
+                       : offsetof(LeafEntryGroup, back) +
+                             sizeof(LeafEntry) *
+                                 (slot - kAssociativity -
+                                  kGroupOverflowSlots)));
   }
   LeafEntryGroup *group_at(int idx) { return &groups[idx]; }
   const LeafEntryGroup *group_at(int idx) const { return &groups[idx]; }
@@ -630,6 +738,7 @@ class LeafPage {
     hdr.debug();
   }
 };
+static_assert(sizeof(LeafPage) <= kLeafPageSize);
 
 class Tree {
  public:
