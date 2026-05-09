@@ -566,6 +566,45 @@ bool rdmaCasMaskWrite(ibv_qp *qp, const RdmaOpRegion &cas_ror, uint64_t equal,
   return true;
 }
 
+bool rdmaCasMaskRead(ibv_qp *qp, const RdmaOpRegion &cas_ror, uint64_t equal,
+                     uint64_t swap, uint64_t mask,
+                     const RdmaOpRegion &read_ror, bool isSignaled,
+                     uint64_t wr_id) {
+  struct ibv_sge sg[2];
+  struct ibv_exp_send_wr wr[2];
+  struct ibv_exp_send_wr *wrBad;
+
+  fillSgeWr(sg[0], wr[0], cas_ror.source, 1 << cas_ror.log_sz, cas_ror.lkey);
+  wr[0].exp_opcode = IBV_EXP_WR_EXT_MASKED_ATOMIC_CMP_AND_SWP;
+  wr[0].exp_send_flags = IBV_EXP_SEND_EXT_ATOMIC_INLINE;
+  wr[0].wr_id = wr_id;
+  wr[0].ext_op.masked_atomics.log_arg_sz = cas_ror.log_sz;
+  wr[0].ext_op.masked_atomics.remote_addr = cas_ror.dest;
+  wr[0].ext_op.masked_atomics.rkey = cas_ror.remoteRKey;
+  auto &op = wr[0].ext_op.masked_atomics.wr_data.inline_data.op.cmp_swap;
+  op.compare_mask = mask;
+  op.compare_val = equal;
+  op.swap_val = swap;
+  op.swap_mask = mask;
+  wr[0].next = &wr[1];
+
+  fillSgeWr(sg[1], wr[1], read_ror.source, read_ror.size, read_ror.lkey);
+  wr[1].exp_opcode = IBV_EXP_WR_RDMA_READ;
+  wr[1].wr.rdma.remote_addr = read_ror.dest;
+  wr[1].wr.rdma.rkey = read_ror.remoteRKey;
+  wr[1].wr_id = wr_id;
+  if (isSignaled) {
+    wr[1].exp_send_flags |= IBV_SEND_SIGNALED;
+  }
+
+  if (ibv_exp_post_send(qp, wr, &wrBad)) {
+    Debug::notifyError("Send with CAS_MASK_READ failed.");
+    sleep(10);
+    return false;
+  }
+  return true;
+}
+
 bool rdmaWriteFaa(ibv_qp *qp, const RdmaOpRegion &write_ror,
                   const RdmaOpRegion &faa_ror, uint64_t add_val,
                   bool isSignaled, uint64_t wrID) {

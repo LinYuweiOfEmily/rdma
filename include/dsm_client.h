@@ -28,10 +28,12 @@ class DSMClient {
 #endif
   // obtain netowrk resources for a thread
   void RegisterThread();
+  void RegisterThreadAt(uint16_t thread_id);
   bool IsRegistered() { return thread_id_ != -1; }
 
   uint16_t get_my_client_id() { return my_client_id_; }
   uint16_t get_my_thread_id() { return thread_id_; }
+  uint16_t get_rnic_id() const { return conf_.rnic_id; }
   uint16_t get_server_size() { return conf_.num_server; }
   uint16_t get_client_size() { return conf_.num_client; }
   uint64_t get_thread_tag() { return thread_tag_; }
@@ -39,6 +41,15 @@ class DSMClient {
   inline void increase_pending_event() { ++pending_event_count_; }
   inline uint64_t get_pending_event_count() { return pending_event_count_; }
   ibv_comp_channel* get_comp_channel() {return  i_con_->comp_channel;}
+  void ClearDebugStats();
+  void AggregatePollingStats(uint64_t &poll_calls, uint64_t &successful_poll_calls,
+                             uint64_t &empty_poll_calls,
+                             uint64_t &cqes_harvested) const;
+  void AggregateDoorbellStats(uint64_t &flush_invocations,
+                              uint64_t &nonempty_flush_invocations,
+                              uint64_t &nonempty_node_batches,
+                              uint64_t &standard_wrs,
+                              uint64_t &experimental_wrs) const;
 
 
   void Barrier(const std::string &ss) {
@@ -115,6 +126,12 @@ class DSMClient {
   bool CasMaskWriteSync(RdmaOpRegion &cas_ror, uint64_t equal, uint64_t swap,
                         uint64_t mask, RdmaOpRegion &write_ror,
                         CoroContext *ctx = nullptr);
+  void CasMaskRead(RdmaOpRegion &cas_ror, uint64_t equal, uint64_t swap,
+                   uint64_t mask, RdmaOpRegion &read_ror, bool signal = true,
+                   CoroContext *ctx = nullptr);
+  bool CasMaskReadSync(RdmaOpRegion &cas_ror, uint64_t equal, uint64_t swap,
+                       uint64_t mask, RdmaOpRegion &read_ror,
+                       CoroContext *ctx = nullptr);
 
   void FaaBound(GlobalAddress gaddr, int log_sz, uint64_t add_val,
                 uint64_t *rdma_buffer, uint64_t mask, bool signal = true,
@@ -157,6 +174,7 @@ class DSMClient {
   uint64_t PollRdmaCq(int count = 1);
   bool PollRdmaCqOnce(uint64_t &wr_id);
   int PollRdmaCqBatch(int max_entries, uint64_t *wr_ids);
+  bool PollRpcCqOnce(RawMessage &msg);
 
   uint64_t Sum(uint64_t value) {
     static uint64_t count = 0;

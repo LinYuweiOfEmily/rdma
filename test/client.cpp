@@ -4,8 +4,12 @@
 #include "Tree.h"
 #include "zipf.h"
 #include "Common.h"
+#include <emmintrin.h>
+
 
 #include <city.h>
+#include <execinfo.h>
+#include <signal.h>
 #include <stdlib.h>
 #include <thread>
 #include <time.h>
@@ -54,6 +58,24 @@ int MAX_TOTAL_THREADS = 0;
 
 Tree *tree;
 DSMClient *dsm_client;
+
+void crash_signal_handler(int sig) {
+  void *frames[64];
+  int frame_count = backtrace(frames, 64);
+  fprintf(stderr, "\n=== client crash signal %d ===\n", sig);
+  backtrace_symbols_fd(frames, frame_count, STDERR_FILENO);
+  fflush(stderr);
+  fflush(stdout);
+  _exit(128 + sig);
+}
+
+void install_crash_diagnostics() {
+  setvbuf(stdout, nullptr, _IONBF, 0);
+  setvbuf(stderr, nullptr, _IONBF, 0);
+  signal(SIGSEGV, crash_signal_handler);
+  signal(SIGABRT, crash_signal_handler);
+  signal(SIGBUS, crash_signal_handler);
+}
 
 inline Key to_key(uint64_t k) {
   return (CityHash64((char *)&k, sizeof(k))) % FLAGS_key_space + 1;
@@ -149,25 +171,81 @@ void ycsb_d(int id) {
 
 
 std::atomic<int64_t> prefill_cnt{0};
+std::atomic<int> local_registered_cnt{0};
+std::atomic<bool> all_nodes_ready{false};
+
+void bind_worker_thread_to_numa(int id) {
+  uint16_t core = static_cast<uint16_t>(id);
+  if ((FLAGS_numa_id % 2) == 0 && core >= define::kSplitGuardProgressCore) {
+    ++core;
+  }
+  bindCoreToNuma(core, FLAGS_numa_id);
+}
+
 void thread_run(int id) {
 
-  // bindCore(id);
+  bind_worker_thread_to_numa(id);
 
   dsm_client->RegisterThread();
+  printf("[CN%d-Th%d] Started, binding NUMA.\n", dsm_client->get_my_client_id(), id);
+  fflush(stdout);
 
+  // 1. 挂载 RDMA 队列
+  dsm_client->RegisterThread();
+  
+  printf("[CN%d-Th%d] RegisterThread Done. RDMA Recv Queue is READY.\n", dsm_client->get_my_client_id(), id);
+  fflush(stdout);
+
+  // ====== 【双重屏障逻辑 & 日志验证】 ======
+  local_registered_cnt.fetch_add(1);
+
+  if (id == 0) {
+    printf("[CN%d-Th0] Waiting for all %d local threads to mount Recv Queues...\n", 
+           dsm_client->get_my_client_id(), MAX_TOTAL_THREADS);
+    fflush(stdout);
+
+    // 第一重：等待本地所有子线程注册完毕
+    while (local_registered_cnt.load() != MAX_TOTAL_THREADS) {
+      _mm_pause();
+    }
+    
+    printf("[CN%d-Th0] 🟢 ALL local threads ready! Entering Global Barrier...\n", dsm_client->get_my_client_id());
+    fflush(stdout);
+
+    // 第二重：本地安全后，和全网节点做同步
+    dsm_client->Barrier("benchmark");
+    
+    printf("[CN%d-Th0] 🚀 Global Barrier Passed! Cluster is synced. Releasing local threads.\n", dsm_client->get_my_client_id());
+    fflush(stdout);
+
+    all_nodes_ready.store(true);
+  } else {
+    printf("[CN%d-Th%d] Waiting for Global Barrier release...\n", dsm_client->get_my_client_id(), id);
+    fflush(stdout);
+  }
+
+  // 所有非 0 线程原地等待
+  while (!all_nodes_ready.load()) {
+    _mm_pause();
+  }
+  // ===================================
 #ifndef BENCH_LOCK
   uint64_t my_id = MAX_TOTAL_THREADS * dsm_client->get_my_client_id() + id;
   printf("I am thread %ld on compute nodes\n", my_id);
   // uint64_t all_thread = MAX_TOTAL_THREADS * dsm_client->get_client_size();
   uint64_t all_prefill_threads =
       FLAGS_num_prefill_threads * dsm_client->get_client_size();
-
+  printf("1\n");
+  fflush(stdout);
   Timer timer;
   Timer total_timer;
   // prefill
   if (id < FLAGS_num_prefill_threads) {
     uint64_t end_prefill_key = FLAGS_prefill_ratio * FLAGS_key_space;
-    uint64_t begin_prefill_key = my_id;
+    // 【修复】：计算一个纯粹为 prefill 服务、严格连续的正交 ID
+    uint64_t safe_prefill_id = FLAGS_num_prefill_threads * dsm_client->get_my_client_id() + id;
+    // 用安全的 ID 作为起点，步长依然是 all_prefill_threads
+    uint64_t begin_prefill_key = safe_prefill_id;
     std::vector<uint64_t> prefill_keys;
     prefill_keys.reserve(
         (end_prefill_key - begin_prefill_key) / all_prefill_threads + 1);
@@ -177,7 +255,9 @@ void thread_run(int id) {
     }
 
     std::shuffle(prefill_keys.begin(), prefill_keys.end(),
-                 std::default_random_engine(my_id));
+                 std::default_random_engine(safe_prefill_id));
+    printf("2\n");
+    fflush(stdout);
     total_timer.begin();
     for (size_t i = 0; i < prefill_keys.size(); ++i) {
       bool measure_lat = i % MEASURE_SAMPLE == 0;
@@ -189,11 +269,13 @@ void thread_run(int id) {
         auto t = timer.end();
         stat_helper.add(id, lat_op, t);
       }
-      // if (id == 0 && i % 100000 == 0) {
-      //   printf("prefill %ld\n", i);
-      //   fflush(stdout);
-      // }
+      if (id == 0 && i % 100000 == 0) {
+        printf("prefill %ld\n", i);
+        fflush(stdout);
+      }
     }
+    printf("3\n");
+    fflush(stdout);
 #ifdef YCSB_D
     uint64_t window = FLAGS_key_space * YCSBD_READ_RANGE;
     for (uint64_t i = end_prefill_key + my_id; i < end_prefill_key + window;
@@ -207,8 +289,10 @@ void thread_run(int id) {
   prefill_cnt.fetch_add(1);
 
   if (id == 0) {
-    while (prefill_cnt.load() != MAX_TOTAL_THREADS)
-      ;
+    while (prefill_cnt.load() != MAX_TOTAL_THREADS) {
+      tree->poll_split_guard_messages();
+      _mm_pause();
+    }
     printf("node %d finish\n", dsm_client->get_my_client_id());
     // dsm->barrier("prefill_finish");
 
@@ -255,12 +339,16 @@ void thread_run(int id) {
     prefill_cnt.store(0);
   }
 
-  while (prefill_cnt.load() != 0)
-    ;
+  while (prefill_cnt.load() != 0) {
+    tree->poll_split_guard_messages();
+    _mm_pause();
+  }
 
 #endif  // ndef BENCH_LOCK
 
   // bench
+  tree->set_hot_read_cache_enabled(true);
+  tree->clear_hot_read_cache_local();
   if (id >= FLAGS_num_bench_threads) {
     return;
   }
@@ -364,6 +452,7 @@ void print_args() {
 
 
 int main(int argc, char *argv[]) {
+  install_crash_diagnostics();
   gflags::ParseCommandLineFlags(&argc, &argv, true);
   print_args();
 
@@ -389,11 +478,12 @@ int main(int argc, char *argv[]) {
   // }
 #endif
 
-  dsm_client->Barrier("benchmark");
+  // dsm_client->Barrier("benchmark");
 
   MAX_TOTAL_THREADS =
       std::max(FLAGS_num_prefill_threads, FLAGS_num_bench_threads);
   tree->set_prefill_split_stats(true);
+  printf("1");
   for (int i = 1; i < MAX_TOTAL_THREADS; i++) {
     th[i] = std::thread(thread_run, i);
   }

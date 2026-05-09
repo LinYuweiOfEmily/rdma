@@ -10,6 +10,9 @@ enum RpcType : uint8_t {
   MALLOC,
   FREE,
   NEW_ROOT,
+  SPLIT_GUARD_BLOCK,
+  SPLIT_GUARD_ACK,
+  SPLIT_GUARD_UNBLOCK,
   TERMINATE,
   NOP,
 };
@@ -22,6 +25,10 @@ struct RawMessage {
 
   GlobalAddress addr; // for malloc
   int level;
+  uint64_t arg0;
+  uint64_t arg1;
+  uint16_t requester_node_id;
+  uint16_t requester_app_id;
 } __attribute__((packed));
 
 class RawMessageConnection : public AbstractMessageConnection {

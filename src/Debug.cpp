@@ -80,5 +80,7 @@ void Debug::notifyError(const char *format, ...) {
             format);          /* Wrap format in a style. */
     vprintf(newFormat, args); /* Print string of notify information. */
     va_end(args);             /* End of variable arguments. */
+    fflush(stdout);
+    fflush(stderr);
 }
 

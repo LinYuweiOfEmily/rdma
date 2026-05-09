@@ -8,7 +8,9 @@
 
 #include <atomic>
 #include <bitset>
+#include <functional>
 #include <limits>
+#include <queue>
 
 #include "Debug.h"
 #include "HugePageAlloc.h"
@@ -50,6 +52,11 @@
 
 // }
 
+namespace define {
+constexpr uint16_t kSplitGuardControlAppID = MAX_APP_THREAD - 1;
+constexpr uint16_t kSplitGuardProgressCore = 55;
+}
+
 // { dir thread
 #define NR_DIRECTORY 1  
 
@@ -57,6 +64,7 @@
 // }
 
 void bindCore(uint16_t core);
+void bindCoreToNuma(uint16_t core, uint16_t numa_id);
 char *getIP();
 char *getMac();
 
@@ -69,11 +77,14 @@ inline int bits_in(std::uint64_t u) {
 
 using CoroYield = boost::coroutines::symmetric_coroutine<void>::yield_type;
 using CoroCall = boost::coroutines::symmetric_coroutine<void>::call_type;
+using CheckFunc = std::function<bool()>;
+using CoroQueue = std::queue<std::pair<uint16_t, CheckFunc>>;
 
 struct CoroContext {
-  CoroYield *yield;
-  CoroCall *master;
-  int coro_id;
+  CoroYield *yield = nullptr;
+  CoroCall *master = nullptr;
+  CoroQueue *busy_waiting_queue = nullptr;
+  int coro_id = 0;
 };
 
 namespace define {
@@ -169,9 +180,8 @@ constexpr size_t kHeaderSize = (kHeaderRawSize + 63) / 64 * 64;
 constexpr uint32_t kPageSize =
     (kHeaderSize + 60 * (sizeof(InternalKey) + sizeof(uint64_t)) + 63) / 64 *
     64;
-constexpr uint32_t kLeafFingerprintMetaBytes = 192;
 constexpr uint32_t kInternalPageSize = kPageSize;
-constexpr uint32_t kLeafPageSize = kPageSize + kLeafFingerprintMetaBytes;
+constexpr uint32_t kLeafPageSize = kPageSize;
 
 __inline__ unsigned long long rdtsc(void) {
   unsigned hi, lo;

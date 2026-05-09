@@ -1,5 +1,7 @@
 #include "dsm_client.h"
 
+#include <mutex>
+
 thread_local int DSMClient::thread_id_ = -1;
 thread_local ThreadConnection *DSMClient::i_con_ = nullptr;
 thread_local char *DSMClient::rdma_buffer_ = nullptr;
@@ -7,6 +9,17 @@ thread_local LocalAllocator DSMClient::local_allocator_;
 thread_local RdmaBuffer DSMClient::rbuf_[define::kMaxCoro];
 thread_local uint64_t DSMClient::thread_tag_ = 0;
 thread_local uint64_t DSMClient::pending_event_count_ = 0;
+uint64_t g_poll_call_cnt[MAX_APP_THREAD] = {0};
+uint64_t g_poll_success_call_cnt[MAX_APP_THREAD] = {0};
+uint64_t g_poll_empty_call_cnt[MAX_APP_THREAD] = {0};
+uint64_t g_poll_cqe_cnt[MAX_APP_THREAD] = {0};
+uint64_t g_doorbell_flush_invocation_cnt[MAX_APP_THREAD] = {0};
+uint64_t g_doorbell_nonempty_flush_invocation_cnt[MAX_APP_THREAD] = {0};
+uint64_t g_doorbell_nonempty_node_batch_cnt[MAX_APP_THREAD] = {0};
+uint64_t g_doorbell_standard_wr_cnt[MAX_APP_THREAD] = {0};
+uint64_t g_doorbell_experimental_wr_cnt[MAX_APP_THREAD] = {0};
+std::mutex g_register_thread_mutex;
+bool g_thread_conn_has_init[MAX_APP_THREAD] = {false};
 #ifdef USE_DOORBELL_BATCHING
 thread_local ibv_send_wr DSMClient::coro_wr_[define::kCoroCnt];
 thread_local ibv_sge DSMClient::coro_sge_[define::kCoroCnt];
@@ -52,45 +65,71 @@ inline void DSMClient::queue_wr(int node_id, ibv_send_wr* wr) {
 
 // 集中敲门铃函数：遍历所有目标节点，一次性把长链表 post 出去
 void DSMClient::FlushDoorbell() {
+  ++g_doorbell_flush_invocation_cnt[thread_id_];
+  bool flushed_any = false;
   for (int i = 0; i < conf_.num_server; ++i) {
     // 1. 发送标准 WR 链表
     if (pending_wr_head_[i] != nullptr) {
+      uint64_t wr_cnt = 0;
+      for (ibv_send_wr *cur = pending_wr_head_[i]; cur != nullptr;
+           cur = cur->next) {
+        ++wr_cnt;
+      }
       struct ibv_send_wr *bad_wr;
       if (ibv_post_send(i_con_->data[0][i], pending_wr_head_[i], &bad_wr)) {
         Debug::notifyError("Batch doorbell failed for node %d (Standard WR)", i);
       }
+      g_doorbell_nonempty_node_batch_cnt[thread_id_]++;
+      g_doorbell_standard_wr_cnt[thread_id_] += wr_cnt;
+      flushed_any = true;
       pending_wr_head_[i] = nullptr;
       pending_wr_tail_[i] = nullptr;
     }
     
     // 2. 【新增】发送实验性 WR 链表 (注意使用的是 ibv_exp_post_send)
     if (pending_exp_wr_head_[i] != nullptr) {
+      uint64_t wr_cnt = 0;
+      for (ibv_exp_send_wr *cur = pending_exp_wr_head_[i]; cur != nullptr;
+           cur = cur->next) {
+        ++wr_cnt;
+      }
       struct ibv_exp_send_wr *bad_exp_wr;
       if (ibv_exp_post_send(i_con_->data[0][i], pending_exp_wr_head_[i], &bad_exp_wr)) {
         Debug::notifyError("Batch doorbell failed for node %d (Experimental WR)", i);
       }
+      g_doorbell_nonempty_node_batch_cnt[thread_id_]++;
+      g_doorbell_experimental_wr_cnt[thread_id_] += wr_cnt;
+      flushed_any = true;
       pending_exp_wr_head_[i] = nullptr;
       pending_exp_wr_tail_[i] = nullptr;
     }
+  }
+  if (flushed_any) {
+    ++g_doorbell_nonempty_flush_invocation_cnt[thread_id_];
   }
 }
 #endif
 
 void DSMClient::RegisterThread() {
-  static bool has_init[MAX_APP_THREAD];
-
   if (thread_id_ != -1) return;
 
-  thread_id_ = app_id_.fetch_add(1);
+  int next_id = app_id_.fetch_add(1);
+  while (next_id == define::kSplitGuardControlAppID) {
+    next_id = app_id_.fetch_add(1);
+  }
+  assert(next_id >= 0 && next_id < MAX_APP_THREAD);
+  thread_id_ = next_id;
   thread_tag_ = thread_id_ + (((uint64_t)get_my_client_id()) << 32) + 1;
 
   i_con_ = th_con_[thread_id_];
 
-  if (!has_init[thread_id_]) {
-    i_con_->message->initRecv();
-    i_con_->message->initSend();
-
-    has_init[thread_id_] = true;
+  {
+    std::lock_guard<std::mutex> lock(g_register_thread_mutex);
+    if (!g_thread_conn_has_init[thread_id_]) {
+      i_con_->message->initRecv();
+      i_con_->message->initSend();
+      g_thread_conn_has_init[thread_id_] = true;
+    }
   }
 
   rdma_buffer_ = (char *)cache_.data + thread_id_ * define::kPerThreadRdmaBuf;
@@ -108,6 +147,27 @@ void DSMClient::RegisterThread() {
     pending_exp_wr_tail_ = new ibv_exp_send_wr*[conf_.num_server]();
   }
 #endif
+}
+
+void DSMClient::RegisterThreadAt(uint16_t requested_thread_id) {
+  assert(requested_thread_id < MAX_APP_THREAD);
+  if (thread_id_ != -1) {
+    assert(thread_id_ == requested_thread_id);
+    return;
+  }
+
+  thread_id_ = requested_thread_id;
+  thread_tag_ = thread_id_ + (((uint64_t)get_my_client_id()) << 32) + 1;
+  i_con_ = th_con_[thread_id_];
+
+  {
+    std::lock_guard<std::mutex> lock(g_register_thread_mutex);
+    if (!g_thread_conn_has_init[thread_id_]) {
+      i_con_->message->initRecv();
+      i_con_->message->initSend();
+      g_thread_conn_has_init[thread_id_] = true;
+    }
+  }
 }
 
 void DSMClient::Read(char *buffer, GlobalAddress gaddr, size_t size,
@@ -675,6 +735,58 @@ bool DSMClient::CasMaskWriteSync(RdmaOpRegion &cas_ror, uint64_t equal,
   }
 }
 
+void DSMClient::CasMaskRead(RdmaOpRegion &cas_ror, uint64_t equal,
+                            uint64_t swap, uint64_t mask,
+                            RdmaOpRegion &read_ror, bool signal,
+                            CoroContext *ctx) {
+  int node_id;
+  {
+    GlobalAddress gaddr;
+    gaddr.raw = cas_ror.dest;
+    node_id = gaddr.nodeID;
+    FillKeysDest(cas_ror, gaddr, cas_ror.is_on_chip);
+  }
+  {
+    GlobalAddress gaddr;
+    gaddr.raw = read_ror.dest;
+    FillKeysDest(read_ror, gaddr, read_ror.is_on_chip);
+  }
+
+  if (ctx == nullptr) {
+    rdmaCasMaskRead(i_con_->data[0][node_id], cas_ror, equal, swap, mask,
+                    read_ror, signal);
+  } else {
+    increase_pending_event();
+    rdmaCasMaskRead(i_con_->data[0][node_id], cas_ror, equal, swap, mask,
+                    read_ror, true, ctx->coro_id);
+    (*ctx->yield)(*ctx->master);
+  }
+}
+
+bool DSMClient::CasMaskReadSync(RdmaOpRegion &cas_ror, uint64_t equal,
+                                uint64_t swap, uint64_t mask,
+                                RdmaOpRegion &read_ror, CoroContext *ctx) {
+  CasMaskRead(cas_ror, equal, swap, mask, read_ror, true, ctx);
+  if (ctx == nullptr) {
+    ibv_wc wc;
+    pollWithCQ(i_con_->cq, 1, &wc);
+  }
+
+  if (cas_ror.log_sz <= 3) {
+    return (equal & mask) == (*(uint64_t *)cas_ror.source & mask);
+  } else {
+    uint64_t *eq = (uint64_t *)equal;
+    uint64_t *old = (uint64_t *)cas_ror.source;
+    uint64_t *m = (uint64_t *)mask;
+    for (int i = 0; i < (1 << (cas_ror.log_sz - 3)); ++i) {
+      if ((eq[i] & m[i]) != (__bswap_64(old[i]) & m[i])) {
+        return false;
+      }
+    }
+    return true;
+  }
+}
+
 void DSMClient::FaaBound(GlobalAddress gaddr, int log_sz, uint64_t add_val,
                          uint64_t *rdma_buffer, uint64_t mask, bool signal,
                          CoroContext *ctx) {
@@ -954,9 +1066,19 @@ uint64_t DSMClient::PollRdmaCq(int count) {
 
 bool DSMClient::PollRdmaCqOnce(uint64_t &wr_id) {
   ibv_wc wc;
+  ++g_poll_call_cnt[thread_id_];
   int res = pollOnce(i_con_->cq, 1, &wc);
 
-  wr_id = wc.wr_id;
+  if (res > 0) {
+    ++g_poll_success_call_cnt[thread_id_];
+    g_poll_cqe_cnt[thread_id_] += res;
+    wr_id = wc.wr_id;
+  } else {
+    if (res == 0) {
+      ++g_poll_empty_call_cnt[thread_id_];
+    }
+    wr_id = 0;
+  }
 
   return res == 1;
 }
@@ -966,7 +1088,14 @@ int DSMClient::PollRdmaCqBatch(int max_entries, uint64_t *wr_ids) {
   ibv_wc wc[max_entries];
   
   // 一次性向底层网卡驱动拉取最多 max_entries 个事件
+  ++g_poll_call_cnt[thread_id_];
   int n = pollOnce(i_con_->cq, max_entries, wc);
+  if (n > 0) {
+    ++g_poll_success_call_cnt[thread_id_];
+    g_poll_cqe_cnt[thread_id_] += n;
+  } else if (n == 0) {
+    ++g_poll_empty_call_cnt[thread_id_];
+  }
 
   // 提取出所有就绪的协程 ID
   for (int i = 0; i < n; ++i) {
@@ -974,4 +1103,64 @@ int DSMClient::PollRdmaCqBatch(int max_entries, uint64_t *wr_ids) {
   }
 
   return n;
+}
+
+bool DSMClient::PollRpcCqOnce(RawMessage &msg) {
+  ibv_wc wc;
+  int res = pollOnce(i_con_->rpc_cq, 1, &wc);
+  if (res <= 0) {
+    return false;
+  }
+  RawMessage *received = (RawMessage *)i_con_->message->getMessage();
+  memcpy(&msg, received, sizeof(RawMessage));
+  return true;
+}
+
+void DSMClient::ClearDebugStats() {
+  for (int i = 0; i < MAX_APP_THREAD; ++i) {
+    g_poll_call_cnt[i] = 0;
+    g_poll_success_call_cnt[i] = 0;
+    g_poll_empty_call_cnt[i] = 0;
+    g_poll_cqe_cnt[i] = 0;
+    g_doorbell_flush_invocation_cnt[i] = 0;
+    g_doorbell_nonempty_flush_invocation_cnt[i] = 0;
+    g_doorbell_nonempty_node_batch_cnt[i] = 0;
+    g_doorbell_standard_wr_cnt[i] = 0;
+    g_doorbell_experimental_wr_cnt[i] = 0;
+  }
+}
+
+void DSMClient::AggregatePollingStats(uint64_t &poll_calls,
+                                      uint64_t &successful_poll_calls,
+                                      uint64_t &empty_poll_calls,
+                                      uint64_t &cqes_harvested) const {
+  poll_calls = 0;
+  successful_poll_calls = 0;
+  empty_poll_calls = 0;
+  cqes_harvested = 0;
+  for (int i = 0; i < MAX_APP_THREAD; ++i) {
+    poll_calls += g_poll_call_cnt[i];
+    successful_poll_calls += g_poll_success_call_cnt[i];
+    empty_poll_calls += g_poll_empty_call_cnt[i];
+    cqes_harvested += g_poll_cqe_cnt[i];
+  }
+}
+
+void DSMClient::AggregateDoorbellStats(uint64_t &flush_invocations,
+                                       uint64_t &nonempty_flush_invocations,
+                                       uint64_t &nonempty_node_batches,
+                                       uint64_t &standard_wrs,
+                                       uint64_t &experimental_wrs) const {
+  flush_invocations = 0;
+  nonempty_flush_invocations = 0;
+  nonempty_node_batches = 0;
+  standard_wrs = 0;
+  experimental_wrs = 0;
+  for (int i = 0; i < MAX_APP_THREAD; ++i) {
+    flush_invocations += g_doorbell_flush_invocation_cnt[i];
+    nonempty_flush_invocations += g_doorbell_nonempty_flush_invocation_cnt[i];
+    nonempty_node_batches += g_doorbell_nonempty_node_batch_cnt[i];
+    standard_wrs += g_doorbell_standard_wr_cnt[i];
+    experimental_wrs += g_doorbell_experimental_wr_cnt[i];
+  }
 }

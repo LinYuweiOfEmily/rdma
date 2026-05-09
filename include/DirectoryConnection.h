@@ -8,12 +8,15 @@ struct RemoteConnectionToClient;
 
 // directory thread
 struct DirectoryConnection {
+  static constexpr uint16_t kSplitGuardControlAppID =
+      define::kSplitGuardControlAppID;
   uint16_t dirID;
 
   RdmaContext ctx;
   ibv_cq *cq;
 
   RawMessageConnection *message;
+  uint32_t num_client;
 
   ibv_qp **data2app[MAX_APP_THREAD];
 
@@ -34,6 +37,9 @@ struct DirectoryConnection {
                       RemoteConnectionToClient *remote_con);
 
   void sendMessage2App(RawMessage *m, uint16_t node_id, uint16_t th_id);
+  void broadcastMessage2App(RawMessage *m, uint16_t th_id,
+                            uint16_t skip_node_id);
+  void broadcastMessage2ControlApp(RawMessage *m, uint16_t skip_node_id);
 };
 
 #endif /* __DIRECTORYCONNECTION_H__ */

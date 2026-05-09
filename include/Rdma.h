@@ -153,6 +153,10 @@ bool rdmaCasMaskWrite(ibv_qp *qp, const RdmaOpRegion &cas_ror, uint64_t equal,
                       uint64_t swap, uint64_t mask,
                       const RdmaOpRegion &write_ror, bool isSignaled,
                       uint64_t wr_id = 0);
+bool rdmaCasMaskRead(ibv_qp *qp, const RdmaOpRegion &cas_ror, uint64_t equal,
+                     uint64_t swap, uint64_t mask,
+                     const RdmaOpRegion &read_ror, bool isSignaled,
+                     uint64_t wr_id = 0);
 bool rdmaWriteFaa(ibv_qp *qp, const RdmaOpRegion &write_ror,
                   const RdmaOpRegion &faa_ror, uint64_t add_val,
                   bool isSignaled, uint64_t wrID = 0);

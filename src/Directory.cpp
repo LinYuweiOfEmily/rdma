@@ -90,6 +90,23 @@ void Directory::process_message(const RawMessage *m) {
     break;
   }
 
+  case RpcType::SPLIT_GUARD_BLOCK:
+  case RpcType::SPLIT_GUARD_UNBLOCK: {
+    send = (RawMessage *)dCon->message->getSendPool();
+    memcpy(send, m, sizeof(RawMessage));
+    dCon->broadcastMessage2ControlApp(send, m->node_id);
+    send = nullptr;
+    break;
+  }
+
+  case RpcType::SPLIT_GUARD_ACK: {
+    send = (RawMessage *)dCon->message->getSendPool();
+    memcpy(send, m, sizeof(RawMessage));
+    dCon->sendMessage2App(send, m->requester_node_id, m->requester_app_id);
+    send = nullptr;
+    break;
+  }
+
   case RpcType::TERMINATE: {
     stop_flag.store(true, std::memory_order_release);
     break;
