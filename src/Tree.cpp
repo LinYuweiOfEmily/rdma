@@ -10,6 +10,7 @@
 #include <utility>
 #include <vector>
 #include <emmintrin.h>
+#include <chrono>
 
 #include "IndexCache.h"
 #include "RdmaBuffer.h"
@@ -72,6 +73,8 @@ uint64_t leaf_group_reread_fallback_cnt[MAX_APP_THREAD] = {0};
 // #define USE_HOT_READ_CACHE
 // #define USE_HOT_ELASTIC_LEAF
 #define USE_LEAF_SPLIT_GUARD
+#define USE_LOCAL_GROUP_X_LOCK
+#define USE_LOCAL_GROUP_WRITE_COMBINE
 #define USE_SPLIT_ONLY_X_LOCK
 #define USE_SX_LOCK
 #define BATCH_LOCK_READ
@@ -102,6 +105,14 @@ uint64_t leaf_group_reread_fallback_cnt[MAX_APP_THREAD] = {0};
 #error "USE_SPLIT_ONLY_X_LOCK requires USE_LEAF_SPLIT_GUARD"
 #endif
 
+#if defined(USE_LOCAL_GROUP_X_LOCK) && !defined(USE_SPLIT_ONLY_X_LOCK)
+#error "USE_LOCAL_GROUP_X_LOCK requires USE_SPLIT_ONLY_X_LOCK"
+#endif
+
+#if defined(USE_LOCAL_GROUP_X_LOCK) && !defined(USE_LEAF_SPLIT_GUARD)
+#error "USE_LOCAL_GROUP_X_LOCK requires USE_LEAF_SPLIT_GUARD"
+#endif
+
 uint64_t cache_miss[MAX_APP_THREAD][8];
 uint64_t cache_hit[MAX_APP_THREAD][8];
 uint64_t latency[MAX_APP_THREAD][LATENCY_WINDOWS];
@@ -118,6 +129,73 @@ uint64_t lock_rdma_faa_cnt[MAX_APP_THREAD] = {0};  // 用于拿票/退票的 Faa
 uint64_t lock_rdma_read_cnt[MAX_APP_THREAD] = {0}; // 用于自旋等锁的 Read 次数     // 单次拿锁最大尝试次数
 uint64_t lock_retry_data_reread_cnt[MAX_APP_THREAD] = {0};
 uint64_t lock_retry_data_reread_bytes[MAX_APP_THREAD] = {0};
+
+// ---------------- Local group lock / split guard stats ----------------
+// These counters diagnose tail latency caused by local group-lock queues
+// blocking split-guard inflight drain and delayed split-guard ACKs.
+
+uint64_t group_lock_acquire_cnt[MAX_APP_THREAD] = {0};
+uint64_t group_lock_wait_event_cnt[MAX_APP_THREAD] = {0};
+uint64_t group_lock_wait_yield_cnt[MAX_APP_THREAD] = {0};
+uint64_t group_lock_wait_us_sum[MAX_APP_THREAD] = {0};
+uint64_t group_lock_wait_us_max[MAX_APP_THREAD] = {0};
+uint64_t group_lock_qdepth_sum[MAX_APP_THREAD] = {0};
+uint64_t group_lock_qdepth_max[MAX_APP_THREAD] = {0};
+
+uint64_t local_group_wc_owner_cnt[MAX_APP_THREAD] = {0};
+uint64_t local_group_wc_waiter_cnt[MAX_APP_THREAD] = {0};
+uint64_t local_group_wc_waiter_return_cnt[MAX_APP_THREAD] = {0};
+uint64_t local_group_wc_apply_cnt[MAX_APP_THREAD] = {0};
+uint64_t local_group_wc_nochange_cnt[MAX_APP_THREAD] = {0};
+uint64_t local_group_wc_replace_cnt[MAX_APP_THREAD] = {0};
+uint64_t local_group_wc_bypass_cnt[MAX_APP_THREAD] = {0};
+
+uint64_t split_guard_begin_cnt[MAX_APP_THREAD] = {0};
+uint64_t split_guard_wait_event_cnt[MAX_APP_THREAD] = {0};
+uint64_t split_guard_wait_yield_cnt[MAX_APP_THREAD] = {0};
+uint64_t split_guard_wait_us_sum[MAX_APP_THREAD] = {0};
+uint64_t split_guard_wait_us_max[MAX_APP_THREAD] = {0};
+uint64_t split_guard_wait_inflight_us_sum[MAX_APP_THREAD] = {0};
+uint64_t split_guard_wait_ack_us_sum[MAX_APP_THREAD] = {0};
+uint64_t split_guard_wait_both_us_sum[MAX_APP_THREAD] = {0};
+uint64_t split_guard_inflight_max[MAX_APP_THREAD] = {0};
+
+std::atomic<uint64_t> split_guard_ack_immediate_cnt{0};
+std::atomic<uint64_t> split_guard_ack_queued_cnt{0};
+std::atomic<uint64_t> split_guard_ack_sent_after_wait_cnt{0};
+std::atomic<uint64_t> split_guard_ack_flush_blocked_cnt{0};
+std::atomic<uint64_t> split_guard_ack_queue_wait_us_sum{0};
+std::atomic<uint64_t> split_guard_ack_queue_wait_us_max{0};
+std::atomic<uint64_t> split_guard_ack_pending_max{0};
+std::atomic<uint64_t> split_guard_ack_blocking_inflight_max{0};
+
+inline uint64_t now_us() {
+  return static_cast<uint64_t>(
+      std::chrono::duration_cast<std::chrono::microseconds>(
+          std::chrono::steady_clock::now().time_since_epoch())
+          .count());
+}
+
+inline bool valid_app_tid(uint16_t tid) {
+  return tid < MAX_APP_THREAD;
+}
+
+inline void update_max_u64(uint64_t &target, uint64_t value) {
+  if (value > target) {
+    target = value;
+  }
+}
+
+inline void atomic_update_max_u64(std::atomic<uint64_t> &target,
+                                  uint64_t value) {
+  uint64_t cur = target.load(std::memory_order_relaxed);
+  while (cur < value &&
+         !target.compare_exchange_weak(cur, value,
+                                       std::memory_order_relaxed,
+                                       std::memory_order_relaxed)) {
+  }
+}
+
 #ifdef USE_HOT_READ_CACHE
 uint64_t hot_read_cache_hit_cnt[MAX_APP_THREAD] = {0};
 uint64_t hot_read_cache_miss_cnt[MAX_APP_THREAD] = {0};
@@ -194,19 +272,19 @@ inline bool try_mark_leaf_splitting(DSMClient *dsm_client,
                                   GlobalAddress page_addr, Header *hdr,
                                   uint64_t *cas_buffer, CoroContext *ctx,
                                   uint16_t tid) {
-uint64_t expected = hdr->control_word;
-if (leaf_control_is_splitting(expected)) {
-  return true;
-}
-uint64_t desired =
-    expected | kNodeControlLockedBit | kNodeControlSplittingBit;
-bool cas_ok = dsm_client->CasSync(get_leaf_control_addr(page_addr), expected,
-                                  desired, cas_buffer, ctx);
-track_rdma(tid, 1, sizeof(uint64_t));
-if (cas_ok) {
-  hdr->control_word = desired;
-}
-return cas_ok;
+  uint64_t expected = hdr->control_word;
+  if (leaf_control_is_splitting(expected)) {
+    return true;
+  }
+  uint64_t desired =
+      expected | kNodeControlLockedBit | kNodeControlSplittingBit;
+  bool cas_ok = dsm_client->CasSync(get_leaf_control_addr(page_addr), expected,
+                                    desired, cas_buffer, ctx);
+  track_rdma(tid, 1, sizeof(uint64_t));
+  if (cas_ok) {
+    hdr->control_word = desired;
+  }
+  return cas_ok;
 }
 
 inline void mark_leaf_sibling_published(Header *hdr) {
@@ -214,9 +292,9 @@ hdr->control_word |= kNodeControlSiblingBit;
 }
 
 inline void clear_leaf_splitting(Header *hdr) {
-uint64_t control_word = leaf_control_next_version(hdr->control_word);
-control_word &= ~(kNodeControlLockedBit | kNodeControlSplittingBit);
-hdr->control_word = control_word;
+  uint64_t control_word = leaf_control_next_version(hdr->control_word);
+  control_word &= ~(kNodeControlLockedBit | kNodeControlSplittingBit);
+  hdr->control_word = control_word;
 }
 
 // ----------------------------------------------------
@@ -247,11 +325,11 @@ constexpr uint8_t kHotLeafBypassBaseCooldown = 4;
 constexpr uint8_t kHotLeafBypassMaxCooldown = 16;
 
 enum class HotLeafState : uint8_t {
-Normal = 0,
-UpdateHot,
-ConflictHot,
-InsertHot,
-FoldPending,
+  Normal = 0,
+  UpdateHot,
+  ConflictHot,
+  InsertHot,
+  FoldPending,
 };
 
 constexpr size_t kHotElasticLeafTableSize = 4096;
@@ -263,19 +341,19 @@ constexpr uint8_t kHotLeafConflictCooldownScale = 4;
 constexpr uint8_t kHotLeafOptimisticProbeInterval = 8;
 
 struct HotLeafBypassEntry {
-uint64_t page_sig = 0;
-uint8_t cooldown = 0;
-uint8_t fail_count = 0;
+  uint64_t page_sig = 0;
+  uint8_t cooldown = 0;
+  uint8_t fail_count = 0;
 };
 
 struct HotElasticLeafEntry {
-uint64_t page_sig = 0;
-HotLeafState state = HotLeafState::Normal;
-uint8_t update_hits = 0;
-uint8_t cas_fails = 0;
-uint8_t insert_conflicts = 0;
-uint8_t cooldown = 0;
-uint8_t optimistic_probe_credit = 0;
+  uint64_t page_sig = 0;
+  HotLeafState state = HotLeafState::Normal;
+  uint8_t update_hits = 0;
+  uint8_t cas_fails = 0;
+  uint8_t insert_conflicts = 0;
+  uint8_t cooldown = 0;
+  uint8_t optimistic_probe_credit = 0;
 };
 
 #ifdef USE_LOCAL_LOCK
@@ -300,162 +378,193 @@ inline uint64_t get_leaf_page_sig(GlobalAddress page_addr) {
 constexpr size_t kLeafSplitGuardTableSize = define::kNumOfLock;
 
 struct LeafSplitGuardToken {
-uint16_t origin_node_id = 0;
-uint16_t origin_app_id = 0;
-uint32_t generation = 0;
+  uint16_t origin_node_id = 0;
+  uint16_t origin_app_id = 0;
+  uint32_t generation = 0;
+};
+
+struct alignas(64) LocalGroupXLock {
+  // Non-FIFO local CAS lock, matching the usual 0 -> 1 exclusive-lock style.
+  // This is intentionally not a ticket lock: a yielded/descheduled waiter cannot
+  // hold a ticket and convoy all later waiters.
+  std::atomic<uint64_t> word{0};
+  std::atomic<uint32_t> waiters{0};
+
+#ifdef USE_LOCAL_GROUP_WRITE_COMBINE
+  std::mutex combine_mutex;
+  static constexpr int kLocalGroupWriteCombineSlots = 8;
+  struct LocalGroupWriteCombineSlot {
+    bool valid = false;
+    bool active = false;
+    Key key = 0;
+    Value value = 0;
+    uint64_t epoch = 0;
+  };
+  LocalGroupWriteCombineSlot combine_slots[kLocalGroupWriteCombineSlots];
+#endif
 };
 
 struct LeafSplitGuardEntry {
-std::atomic<uint32_t> inflight{0};
-std::mutex active_mutex;
-std::vector<LeafSplitGuardToken> active_tokens;
+  std::atomic<uint32_t> inflight{0};
+  std::mutex active_mutex;
+  std::vector<LeafSplitGuardToken> active_tokens;
+
+#ifdef USE_LOCAL_GROUP_X_LOCK
+  LocalGroupXLock group_locks[kNumGroup];
+#endif
 };
 
 struct SplitGuardAckState {
-uint64_t page_sig = 0;
-uint32_t generation = 0;
-uint32_t ack_count = 0;
-uint64_t ack_node_mask = 0;
+  uint64_t page_sig = 0;
+  uint32_t generation = 0;
+  uint32_t ack_count = 0;
+  uint64_t ack_node_mask = 0;
 };
 
 LeafSplitGuardEntry leaf_split_guard_table[kLeafSplitGuardTableSize];
 std::atomic<uint32_t> leaf_split_guard_generation{1};
+struct PendingLeafSplitGuardAck {
+  RawMessage msg;
+  uint64_t queued_us = 0;
+  uint32_t max_inflight_seen = 0;
+};
+
 std::mutex pending_leaf_split_guard_acks_mutex;
-std::vector<RawMessage> pending_leaf_split_guard_acks;
+std::vector<PendingLeafSplitGuardAck> pending_leaf_split_guard_acks;
 std::mutex split_guard_ack_states_mutex;
 std::vector<SplitGuardAckState> split_guard_ack_states;
 std::atomic<bool> leaf_split_guard_progress_started{false};
 
 inline size_t get_leaf_split_guard_slot(GlobalAddress page_addr) {
-GlobalAddress a;
-a.offset = page_addr.offset;
-a.nodeID = page_addr.nodeID;
-return CityHash64(reinterpret_cast<const char *>(&a), sizeof(a)) %
-        kLeafSplitGuardTableSize;
+  GlobalAddress a;
+  a.offset = page_addr.offset;
+  a.nodeID = page_addr.nodeID;
+  return CityHash64(reinterpret_cast<const char *>(&a), sizeof(a)) %
+          kLeafSplitGuardTableSize;
 }
 
 inline bool leaf_split_guard_entry_has_active_tokens(
   LeafSplitGuardEntry *entry) {
-std::lock_guard<std::mutex> lock(entry->active_mutex);
-return !entry->active_tokens.empty();
+  std::lock_guard<std::mutex> lock(entry->active_mutex);
+  return !entry->active_tokens.empty();
 }
 
 inline LeafSplitGuardEntry *get_leaf_split_guard_entry(GlobalAddress page_addr) {
-return &leaf_split_guard_table[get_leaf_split_guard_slot(page_addr)];
+  return &leaf_split_guard_table[get_leaf_split_guard_slot(page_addr)];
 }
 
 inline bool leaf_split_guard_is_blocked(LeafSplitGuardEntry *entry) {
-return leaf_split_guard_entry_has_active_tokens(entry);
+  return leaf_split_guard_entry_has_active_tokens(entry);
 }
 
 inline SplitGuardAckState *find_split_guard_ack_state(uint64_t page_sig,
                                                     uint32_t generation) {
-for (auto &state : split_guard_ack_states) {
-  if (state.page_sig == page_sig && state.generation == generation) {
-    return &state;
+  for (auto &state : split_guard_ack_states) {
+    if (state.page_sig == page_sig && state.generation == generation) {
+      return &state;
+    }
   }
-}
-return nullptr;
+  return nullptr;
 }
 
 inline void register_split_guard_ack_state(uint64_t page_sig,
                                           uint32_t generation) {
-std::lock_guard<std::mutex> lock(split_guard_ack_states_mutex);
-if (find_split_guard_ack_state(page_sig, generation) == nullptr) {
-  split_guard_ack_states.push_back({page_sig, generation, 0, 0});
-}
+  std::lock_guard<std::mutex> lock(split_guard_ack_states_mutex);
+  if (find_split_guard_ack_state(page_sig, generation) == nullptr) {
+    split_guard_ack_states.push_back({page_sig, generation, 0, 0});
+  }
 }
 
 inline void unregister_split_guard_ack_state(uint64_t page_sig,
                                             uint32_t generation) {
-std::lock_guard<std::mutex> lock(split_guard_ack_states_mutex);
-split_guard_ack_states.erase(
-    std::remove_if(split_guard_ack_states.begin(),
-                    split_guard_ack_states.end(),
-                    [=](const SplitGuardAckState &s) {
-                      return s.page_sig == page_sig &&
-                            s.generation == generation;
-                    }),
-    split_guard_ack_states.end());
+  std::lock_guard<std::mutex> lock(split_guard_ack_states_mutex);
+  split_guard_ack_states.erase(
+      std::remove_if(split_guard_ack_states.begin(),
+                      split_guard_ack_states.end(),
+                      [=](const SplitGuardAckState &s) {
+                        return s.page_sig == page_sig &&
+                              s.generation == generation;
+                      }),
+      split_guard_ack_states.end());
 }
 
 inline bool split_guard_ack_state_ready(uint64_t page_sig, uint32_t generation,
                                       uint32_t expected_acks) {
-std::lock_guard<std::mutex> lock(split_guard_ack_states_mutex);
-SplitGuardAckState *state =
-    find_split_guard_ack_state(page_sig, generation);
-return state != nullptr && state->ack_count >= expected_acks;
+  std::lock_guard<std::mutex> lock(split_guard_ack_states_mutex);
+  SplitGuardAckState *state =
+      find_split_guard_ack_state(page_sig, generation);
+  return state != nullptr && state->ack_count >= expected_acks;
 }
 
 inline bool mark_leaf_split_guard_ack_from_node(uint64_t *ack_node_mask,
                                               uint16_t node_id) {
-if (node_id >= 64) {
+  if (node_id >= 64) {
+    return true;
+  }
+  uint64_t bit = 1ull << node_id;
+  if ((*ack_node_mask & bit) != 0) {
+    return false;
+  }
+  *ack_node_mask |= bit;
   return true;
-}
-uint64_t bit = 1ull << node_id;
-if ((*ack_node_mask & bit) != 0) {
-  return false;
-}
-*ack_node_mask |= bit;
-return true;
 }
 
 inline void record_split_guard_ack_state(const RawMessage &msg) {
-std::lock_guard<std::mutex> lock(split_guard_ack_states_mutex);
-SplitGuardAckState *state = find_split_guard_ack_state(
-    msg.arg0, static_cast<uint32_t>(msg.arg1));
-if (state != nullptr &&
-    mark_leaf_split_guard_ack_from_node(&state->ack_node_mask,
-                                        msg.node_id)) {
-  ++state->ack_count;
-}
+  std::lock_guard<std::mutex> lock(split_guard_ack_states_mutex);
+  SplitGuardAckState *state = find_split_guard_ack_state(
+      msg.arg0, static_cast<uint32_t>(msg.arg1));
+  if (state != nullptr &&
+      mark_leaf_split_guard_ack_from_node(&state->ack_node_mask,
+                                          msg.node_id)) {
+    ++state->ack_count;
+  }
 }
 
 inline uint16_t leaf_split_guard_control_app_id() {
-return define::kSplitGuardControlAppID;
+  return define::kSplitGuardControlAppID;
 }
 
 inline bool leaf_split_guard_same_token(const LeafSplitGuardToken &token,
                                       uint16_t origin_node_id,
                                       uint16_t origin_app_id,
                                       uint32_t generation) {
-return token.origin_node_id == origin_node_id &&
-        token.origin_app_id == origin_app_id &&
-        token.generation == generation;
+  return token.origin_node_id == origin_node_id &&
+          token.origin_app_id == origin_app_id &&
+          token.generation == generation;
 }
 
 inline void apply_leaf_split_guard_block(GlobalAddress page_addr,
                                         uint16_t origin_node_id,
                                         uint16_t origin_app_id,
                                         uint32_t generation) {
-LeafSplitGuardEntry *entry = get_leaf_split_guard_entry(page_addr);
-{
-  std::lock_guard<std::mutex> lock(entry->active_mutex);
-  for (const auto &token : entry->active_tokens) {
-    if (leaf_split_guard_same_token(token, origin_node_id, origin_app_id,
-                                    generation)) {
-      return;
+  LeafSplitGuardEntry *entry = get_leaf_split_guard_entry(page_addr);
+  {
+    std::lock_guard<std::mutex> lock(entry->active_mutex);
+    for (const auto &token : entry->active_tokens) {
+      if (leaf_split_guard_same_token(token, origin_node_id, origin_app_id,
+                                      generation)) {
+        return;
+      }
     }
+    entry->active_tokens.push_back({origin_node_id, origin_app_id, generation});
   }
-  entry->active_tokens.push_back({origin_node_id, origin_app_id, generation});
-}
 }
 
 inline void apply_leaf_split_guard_unblock(GlobalAddress page_addr,
                                           uint16_t origin_node_id,
                                           uint16_t origin_app_id,
                                           uint32_t generation) {
-LeafSplitGuardEntry *entry = get_leaf_split_guard_entry(page_addr);
-{
-  std::lock_guard<std::mutex> lock(entry->active_mutex);
-  entry->active_tokens.erase(
-      std::remove_if(entry->active_tokens.begin(), entry->active_tokens.end(),
-                      [=](const LeafSplitGuardToken &token) {
-                        return leaf_split_guard_same_token(
-                            token, origin_node_id, origin_app_id, generation);
-                      }),
-      entry->active_tokens.end());
-}
+  LeafSplitGuardEntry *entry = get_leaf_split_guard_entry(page_addr);
+  {
+    std::lock_guard<std::mutex> lock(entry->active_mutex);
+    entry->active_tokens.erase(
+        std::remove_if(entry->active_tokens.begin(), entry->active_tokens.end(),
+                        [=](const LeafSplitGuardToken &token) {
+                          return leaf_split_guard_same_token(
+                              token, origin_node_id, origin_app_id, generation);
+                        }),
+        entry->active_tokens.end());
+  }
 }
 
 inline void send_leaf_split_guard_message(DSMClient *dsm_client,
@@ -463,48 +572,75 @@ inline void send_leaf_split_guard_message(DSMClient *dsm_client,
                                         GlobalAddress page_addr,
                                         uint64_t page_sig,
                                         uint32_t generation) {
-RawMessage m{};
-m.type = type;
-m.addr = page_addr;
-m.arg0 = page_sig;
-m.arg1 = generation;
-m.requester_node_id = dsm_client->get_my_client_id();
-m.requester_app_id = leaf_split_guard_control_app_id();
-dsm_client->RpcCallDir(m, page_addr.nodeID);
+  RawMessage m{};
+  m.type = type;
+  m.addr = page_addr;
+  m.arg0 = page_sig;
+  m.arg1 = generation;
+  m.requester_node_id = dsm_client->get_my_client_id();
+  m.requester_app_id = leaf_split_guard_control_app_id();
+  dsm_client->RpcCallDir(m, page_addr.nodeID);
 }
 
 inline void send_leaf_split_guard_ack(DSMClient *dsm_client,
                                     const RawMessage &block_msg) {
-RawMessage ack{};
-ack.type = RpcType::SPLIT_GUARD_ACK;
-ack.addr = block_msg.addr;
-ack.arg0 = block_msg.arg0;
-ack.arg1 = block_msg.arg1;
-ack.requester_node_id = block_msg.requester_node_id;
-ack.requester_app_id = block_msg.requester_app_id;
-dsm_client->RpcCallDir(ack, block_msg.addr.nodeID);
+  RawMessage ack{};
+  ack.type = RpcType::SPLIT_GUARD_ACK;
+  ack.addr = block_msg.addr;
+  ack.arg0 = block_msg.arg0;
+  ack.arg1 = block_msg.arg1;
+  ack.requester_node_id = block_msg.requester_node_id;
+  ack.requester_app_id = block_msg.requester_app_id;
+  dsm_client->RpcCallDir(ack, block_msg.addr.nodeID);
 }
 
 inline void queue_leaf_split_guard_ack(const RawMessage &block_msg) {
-std::lock_guard<std::mutex> lock(pending_leaf_split_guard_acks_mutex);
-pending_leaf_split_guard_acks.push_back(block_msg);
+  std::lock_guard<std::mutex> lock(pending_leaf_split_guard_acks_mutex);
+  pending_leaf_split_guard_acks.push_back(
+      PendingLeafSplitGuardAck{block_msg, now_us(), 0});
+  split_guard_ack_queued_cnt.fetch_add(1, std::memory_order_relaxed);
+  atomic_update_max_u64(split_guard_ack_pending_max,
+                        pending_leaf_split_guard_acks.size());
 }
 
 inline void flush_pending_leaf_split_guard_acks(DSMClient *dsm_client) {
-std::lock_guard<std::mutex> lock(pending_leaf_split_guard_acks_mutex);
-for (size_t i = 0; i < pending_leaf_split_guard_acks.size();) {
-  const RawMessage &msg = pending_leaf_split_guard_acks[i];
-  LeafSplitGuardEntry *entry = get_leaf_split_guard_entry(msg.addr);
-  bool ready = entry->inflight.load(std::memory_order_acquire) == 0;
-  if (ready) {
-    send_leaf_split_guard_ack(dsm_client, msg);
-    pending_leaf_split_guard_acks[i] =
-        pending_leaf_split_guard_acks.back();
-    pending_leaf_split_guard_acks.pop_back();
-    continue;
+  std::lock_guard<std::mutex> lock(pending_leaf_split_guard_acks_mutex);
+
+  atomic_update_max_u64(split_guard_ack_pending_max,
+                        pending_leaf_split_guard_acks.size());
+
+  for (size_t i = 0; i < pending_leaf_split_guard_acks.size();) {
+    PendingLeafSplitGuardAck &pending = pending_leaf_split_guard_acks[i];
+    const RawMessage &msg = pending.msg;
+
+    LeafSplitGuardEntry *entry = get_leaf_split_guard_entry(msg.addr);
+    uint32_t inflight = entry->inflight.load(std::memory_order_acquire);
+    bool ready = inflight == 0;
+
+    if (ready) {
+      uint64_t wait_us = now_us() - pending.queued_us;
+      split_guard_ack_queue_wait_us_sum.fetch_add(wait_us,
+                                                  std::memory_order_relaxed);
+      atomic_update_max_u64(split_guard_ack_queue_wait_us_max, wait_us);
+      split_guard_ack_sent_after_wait_cnt.fetch_add(1,
+                                                    std::memory_order_relaxed);
+
+      send_leaf_split_guard_ack(dsm_client, msg);
+
+      pending_leaf_split_guard_acks[i] =
+          pending_leaf_split_guard_acks.back();
+      pending_leaf_split_guard_acks.pop_back();
+      continue;
+    }
+
+    split_guard_ack_flush_blocked_cnt.fetch_add(1, std::memory_order_relaxed);
+    if (inflight > pending.max_inflight_seen) {
+      pending.max_inflight_seen = inflight;
+    }
+    atomic_update_max_u64(split_guard_ack_blocking_inflight_max, inflight);
+
+    ++i;
   }
-  ++i;
-}
 }
 
 inline bool handle_leaf_split_guard_message(DSMClient *dsm_client,
@@ -513,91 +649,107 @@ inline bool handle_leaf_split_guard_message(DSMClient *dsm_client,
                                           uint32_t wait_generation,
                                           uint32_t *ack_count,
                                           uint64_t *ack_node_mask = nullptr) {
-if (msg.type == RpcType::SPLIT_GUARD_BLOCK) {
-  apply_leaf_split_guard_block(msg.addr, msg.requester_node_id,
-                                msg.requester_app_id,
-                                static_cast<uint32_t>(msg.arg1));
-  LeafSplitGuardEntry *entry = get_leaf_split_guard_entry(msg.addr);
-  bool ready = entry->inflight.load(std::memory_order_acquire) == 0;
-  if (ready) {
-    send_leaf_split_guard_ack(dsm_client, msg);
-  } else {
-    queue_leaf_split_guard_ack(msg);
-  }
-  return true;
-}
-if (msg.type == RpcType::SPLIT_GUARD_UNBLOCK) {
-  apply_leaf_split_guard_unblock(msg.addr, msg.requester_node_id,
+  if (msg.type == RpcType::SPLIT_GUARD_BLOCK) {
+    apply_leaf_split_guard_block(msg.addr, msg.requester_node_id,
                                   msg.requester_app_id,
                                   static_cast<uint32_t>(msg.arg1));
-  return true;
-}
-if (msg.type == RpcType::SPLIT_GUARD_ACK) {
-  if (ack_count != nullptr && msg.arg0 == wait_page_sig &&
-      static_cast<uint32_t>(msg.arg1) == wait_generation &&
-      (ack_node_mask == nullptr ||
-        mark_leaf_split_guard_ack_from_node(ack_node_mask, msg.node_id))) {
-    ++(*ack_count);
+    LeafSplitGuardEntry *entry = get_leaf_split_guard_entry(msg.addr);
+    uint32_t inflight = entry->inflight.load(std::memory_order_acquire);
+    bool ready = inflight == 0;
+    if (ready) {
+      split_guard_ack_immediate_cnt.fetch_add(1, std::memory_order_relaxed);
+      send_leaf_split_guard_ack(dsm_client, msg);
+    } else {
+      atomic_update_max_u64(split_guard_ack_blocking_inflight_max, inflight);
+      queue_leaf_split_guard_ack(msg);
+    }
+    return true;
   }
-  record_split_guard_ack_state(msg);
-  return true;
-}
-return false;
+  if (msg.type == RpcType::SPLIT_GUARD_UNBLOCK) {
+    apply_leaf_split_guard_unblock(msg.addr, msg.requester_node_id,
+                                    msg.requester_app_id,
+                                    static_cast<uint32_t>(msg.arg1));
+    return true;
+  }
+  if (msg.type == RpcType::SPLIT_GUARD_ACK) {
+    if (ack_count != nullptr && msg.arg0 == wait_page_sig &&
+        static_cast<uint32_t>(msg.arg1) == wait_generation &&
+        (ack_node_mask == nullptr ||
+          mark_leaf_split_guard_ack_from_node(ack_node_mask, msg.node_id))) {
+      ++(*ack_count);
+    }
+    record_split_guard_ack_state(msg);
+    return true;
+  }
+  return false;
 }
 
 inline void drain_leaf_split_guard_messages(DSMClient *dsm_client) {
-RawMessage msg;
-while (dsm_client->PollRpcCqOnce(msg)) {
-  // printf("CN%d received Split Guard from MN (originated from CN%d)\n", dsm_client->get_my_client_id(), msg.requester_node_id);
-  handle_leaf_split_guard_message(dsm_client, msg, 0, 0, nullptr);
-}
-flush_pending_leaf_split_guard_acks(dsm_client);
+  RawMessage msg;
+  while (dsm_client->PollRpcCqOnce(msg)) {
+    // printf("CN%d received Split Guard from MN (originated from CN%d)\n", dsm_client->get_my_client_id(), msg.requester_node_id);
+    handle_leaf_split_guard_message(dsm_client, msg, 0, 0, nullptr);
+  }
+  flush_pending_leaf_split_guard_acks(dsm_client);
 }
 
 inline void leaf_split_guard_progress_loop(DSMClient *dsm_client) {
-dsm_client->RegisterThreadAt(leaf_split_guard_control_app_id());
-bindCoreToNuma(define::kSplitGuardProgressCore, 0);
-while (true) {
-  RawMessage msg;
-  if (dsm_client->PollRpcCqOnce(msg)) {
-    handle_leaf_split_guard_message(dsm_client, msg, 0, 0, nullptr);
-    flush_pending_leaf_split_guard_acks(dsm_client);
-  } else {
-    flush_pending_leaf_split_guard_acks(dsm_client);
-    _mm_pause();
+  dsm_client->RegisterThreadAt(leaf_split_guard_control_app_id());
+  bindCoreToNuma(define::kSplitGuardProgressCore, 0);
+  while (true) {
+    RawMessage msg;
+    if (dsm_client->PollRpcCqOnce(msg)) {
+      handle_leaf_split_guard_message(dsm_client, msg, 0, 0, nullptr);
+      flush_pending_leaf_split_guard_acks(dsm_client);
+    } else {
+      flush_pending_leaf_split_guard_acks(dsm_client);
+      _mm_pause();
+    }
   }
-}
 }
 
 inline void start_leaf_split_guard_progress_thread(DSMClient *dsm_client) {
-bool expected = false;
-if (!leaf_split_guard_progress_started.compare_exchange_strong(
-        expected, true, std::memory_order_acq_rel)) {
-  return;
-}
-std::thread([dsm_client]() { leaf_split_guard_progress_loop(dsm_client); })
-    .detach();
+  bool expected = false;
+  if (!leaf_split_guard_progress_started.compare_exchange_strong(
+          expected, true, std::memory_order_acq_rel)) {
+    return;
+  }
+  std::thread([dsm_client]() { leaf_split_guard_progress_loop(dsm_client); })
+      .detach();
 }
 
 inline bool enter_leaf_split_guard(DSMClient *dsm_client,
                                   GlobalAddress page_addr) {
-// drain_leaf_split_guard_messages(dsm_client);
-LeafSplitGuardEntry *entry = get_leaf_split_guard_entry(page_addr);
-if (leaf_split_guard_is_blocked(entry)) {
-  return false;
-}
-entry->inflight.fetch_add(1, std::memory_order_acq_rel);
-if (leaf_split_guard_is_blocked(entry)) {
-  entry->inflight.fetch_sub(1, std::memory_order_acq_rel);
-  return false;
-}
-return true;
+  // drain_leaf_split_guard_messages(dsm_client);
+  LeafSplitGuardEntry *entry = get_leaf_split_guard_entry(page_addr);
+  if (leaf_split_guard_is_blocked(entry)) {
+    return false;
+  }
+  entry->inflight.fetch_add(1, std::memory_order_acq_rel);
+  if (leaf_split_guard_is_blocked(entry)) {
+    entry->inflight.fetch_sub(1, std::memory_order_acq_rel);
+    return false;
+  }
+  return true;
 }
 
 inline void wait_until_enter_leaf_split_guard(DSMClient *dsm_client,
                                             GlobalAddress page_addr,
                                             CoroContext *ctx) {
-while (!enter_leaf_split_guard(dsm_client, page_addr)) {
+  while (!enter_leaf_split_guard(dsm_client, page_addr)) {
+    if (ctx != nullptr && ctx->busy_waiting_queue != nullptr) {
+      ctx->busy_waiting_queue->push(
+          std::make_pair(ctx->coro_id, []() { return true; }));
+      (*ctx->yield)(*ctx->master);
+    } else {
+      _mm_pause();
+      // drain_leaf_split_guard_messages(dsm_client);
+    }
+  }
+}
+
+inline void yield_after_optimistic_leaf_conflict(DSMClient *dsm_client,
+                                                CoroContext *ctx) {
   if (ctx != nullptr && ctx->busy_waiting_queue != nullptr) {
     ctx->busy_waiting_queue->push(
         std::make_pair(ctx->coro_id, []() { return true; }));
@@ -607,87 +759,445 @@ while (!enter_leaf_split_guard(dsm_client, page_addr)) {
     // drain_leaf_split_guard_messages(dsm_client);
   }
 }
-}
-
-inline void yield_after_optimistic_leaf_conflict(DSMClient *dsm_client,
-                                                CoroContext *ctx) {
-if (ctx != nullptr && ctx->busy_waiting_queue != nullptr) {
-  ctx->busy_waiting_queue->push(
-      std::make_pair(ctx->coro_id, []() { return true; }));
-  (*ctx->yield)(*ctx->master);
-} else {
-  _mm_pause();
-  // drain_leaf_split_guard_messages(dsm_client);
-}
-}
 
 inline void leave_leaf_split_guard(DSMClient *dsm_client, GlobalAddress page_addr) {
-LeafSplitGuardEntry *entry = get_leaf_split_guard_entry(page_addr);
-entry->inflight.fetch_sub(1, std::memory_order_acq_rel);
+  LeafSplitGuardEntry *entry = get_leaf_split_guard_entry(page_addr);
+  entry->inflight.fetch_sub(1, std::memory_order_acq_rel);
 // flush_pending_leaf_split_guard_acks(dsm_client);
 }
 
-inline uint32_t begin_leaf_split_guard(DSMClient *dsm_client,
-                                      GlobalAddress page_addr,
-                                      CoroContext *ctx) {
-uint64_t page_sig = get_leaf_page_sig(page_addr);
-uint32_t generation =
-    leaf_split_guard_generation.fetch_add(1, std::memory_order_acq_rel) + 1;
-apply_leaf_split_guard_block(page_addr, dsm_client->get_my_client_id(),
-                              leaf_split_guard_control_app_id(), generation);
+#ifdef USE_LOCAL_GROUP_X_LOCK
+#ifdef USE_LOCAL_GROUP_WRITE_COMBINE
+struct LocalGroupWriteCombineToken {
+  LeafSplitGuardEntry *entry = nullptr;
+  int group_id = -1;
+  int slot_idx = -1;
+  Key key = 0;
+  uint64_t target_epoch = 0;
+  bool owner = false;
+  bool valid = false;
+};
 
-uint32_t expected_acks =
-    dsm_client->get_client_size() > 0 ? dsm_client->get_client_size() - 1 : 0;
-register_split_guard_ack_state(page_sig, generation);
-if (expected_acks > 0) {
-  send_leaf_split_guard_message(dsm_client, RpcType::SPLIT_GUARD_BLOCK,
-                                page_addr, page_sig, generation);
+inline LocalGroupWriteCombineToken begin_local_group_write_combine(
+    LeafSplitGuardEntry *entry, int group_id, const Key &k, const Value &v,
+    uint16_t tid) {
+  assert(group_id >= 0 && group_id < kNumGroup);
+
+  LocalGroupWriteCombineToken token;
+  token.entry = entry;
+  token.group_id = group_id;
+  token.key = k;
+
+  LocalGroupXLock *lock = &entry->group_locks[group_id];
+  std::lock_guard<std::mutex> guard(lock->combine_mutex);
+
+  int empty_slot = -1;
+  int inactive_same_key = -1;
+  int inactive_victim = -1;
+  for (int i = 0; i < LocalGroupXLock::kLocalGroupWriteCombineSlots; ++i) {
+    auto &slot = lock->combine_slots[i];
+    if (slot.valid && slot.active && slot.key == k) {
+      slot.value = v;
+      token.slot_idx = i;
+      token.target_epoch = slot.epoch + 1;
+      token.owner = false;
+      token.valid = true;
+      if (valid_app_tid(tid)) {
+        local_group_wc_waiter_cnt[tid]++;
+      }
+      return token;
+    }
+    if (slot.valid && !slot.active && slot.key == k) {
+      inactive_same_key = i;
+    }
+    if (slot.valid && !slot.active && inactive_victim < 0) {
+      inactive_victim = i;
+    }
+    if (!slot.valid && empty_slot < 0) {
+      empty_slot = i;
+    }
+  }
+
+  int owner_slot = inactive_same_key >= 0 ? inactive_same_key : empty_slot;
+  if (owner_slot < 0) {
+    owner_slot = inactive_victim;
+  }
+  if (owner_slot < 0) {
+    if (valid_app_tid(tid)) {
+      local_group_wc_bypass_cnt[tid]++;
+    }
+    return token;
+  }
+
+  auto &slot = lock->combine_slots[owner_slot];
+  if (slot.valid && slot.key != k && valid_app_tid(tid)) {
+    local_group_wc_replace_cnt[tid]++;
+  }
+  slot.valid = true;
+  slot.active = true;
+  slot.key = k;
+  slot.value = v;
+
+  token.slot_idx = owner_slot;
+  token.target_epoch = slot.epoch + 1;
+  token.owner = true;
+  token.valid = true;
+  if (valid_app_tid(tid)) {
+    local_group_wc_owner_cnt[tid]++;
+  }
+  return token;
 }
 
-if (ctx != nullptr) {
-  LeafSplitGuardEntry *entry = get_leaf_split_guard_entry(page_addr);
-  auto guard_ready = [=]() {
-    return entry->inflight.load(std::memory_order_acquire) == 0 &&
-            split_guard_ack_state_ready(page_sig, generation, expected_acks);
-  };
+inline bool local_group_write_combine_finished(
+    const LocalGroupWriteCombineToken &token) {
+  if (!token.valid || token.owner || token.entry == nullptr ||
+      token.group_id < 0 || token.slot_idx < 0) {
+    return true;
+  }
 
-  while (!guard_ready()) {
-    if (ctx->busy_waiting_queue != nullptr) {
-      ctx->busy_waiting_queue->push(
-          std::make_pair(ctx->coro_id, guard_ready));
+  LocalGroupXLock *lock = &token.entry->group_locks[token.group_id];
+  std::lock_guard<std::mutex> guard(lock->combine_mutex);
+  auto &slot = lock->combine_slots[token.slot_idx];
+  if (!slot.valid || slot.key != token.key) {
+    return true;
+  }
+  return slot.epoch >= token.target_epoch;
+}
+
+inline void wait_for_local_group_write_combine(
+    const LocalGroupWriteCombineToken &token, CoroContext *ctx) {
+  while (!local_group_write_combine_finished(token)) {
+    if (ctx != nullptr && ctx->busy_waiting_queue != nullptr) {
+      ctx->busy_waiting_queue->push(std::make_pair(
+          ctx->coro_id, [token]() { return local_group_write_combine_finished(token); }));
       (*ctx->yield)(*ctx->master);
     } else {
       _mm_pause();
     }
-    if (guard_ready()) {
-      break;
-    }
   }
-  unregister_split_guard_ack_state(page_sig, generation);
-  return generation;
 }
 
-uint32_t ack_count = 0;
-uint64_t ack_node_mask = 0;
-LeafSplitGuardEntry *entry = get_leaf_split_guard_entry(page_addr);
-bool split_guard_wait_active = true;
-while (entry->inflight.load(std::memory_order_acquire) != 0 ||
-        !split_guard_ack_state_ready(page_sig, generation, expected_acks)) {
-  RawMessage msg;
-  if (dsm_client->PollRpcCqOnce(msg)) {
-    handle_leaf_split_guard_message(dsm_client, msg, page_sig, generation,
-                                    &ack_count, &ack_node_mask);
-    flush_pending_leaf_split_guard_acks(dsm_client);
-  } else {
-    flush_pending_leaf_split_guard_acks(dsm_client);
-    _mm_pause();
+inline void finish_local_group_write_combine(
+    const LocalGroupWriteCombineToken &token) {
+  if (!token.valid || !token.owner || token.entry == nullptr ||
+      token.group_id < 0 || token.slot_idx < 0) {
+    return;
+  }
+
+  LocalGroupXLock *lock = &token.entry->group_locks[token.group_id];
+  std::lock_guard<std::mutex> guard(lock->combine_mutex);
+  auto &slot = lock->combine_slots[token.slot_idx];
+  if (slot.valid && slot.active && slot.key == token.key) {
+    slot.active = false;
+    slot.epoch++;
   }
 }
-if (split_guard_wait_active) {
-  unregister_split_guard_ack_state(page_sig, generation);
-  split_guard_wait_active = false;
+
+inline bool consume_local_group_write_combine(LeafSplitGuardEntry *entry,
+                                              int group_id, const Key &k,
+                                              Value &v, uint16_t tid) {
+  assert(group_id >= 0 && group_id < kNumGroup);
+
+  LocalGroupXLock *lock = &entry->group_locks[group_id];
+  std::lock_guard<std::mutex> guard(lock->combine_mutex);
+  for (int i = 0; i < LocalGroupXLock::kLocalGroupWriteCombineSlots; ++i) {
+    auto &slot = lock->combine_slots[i];
+    if (slot.valid && slot.key == k) {
+      if (slot.value != v) {
+        v = slot.value;
+        if (valid_app_tid(tid)) {
+          local_group_wc_apply_cnt[tid]++;
+        }
+        return true;
+      }
+      if (valid_app_tid(tid)) {
+        local_group_wc_nochange_cnt[tid]++;
+      }
+      return false;
+    }
+  }
+  return false;
 }
-return generation;
+#endif
+
+inline void acquire_local_group_x_lock(LeafSplitGuardEntry *entry,
+                                       int group_id,
+                                       CoroContext *ctx,
+                                       uint16_t tid) {
+  assert(group_id >= 0 && group_id < kNumGroup);
+
+  LocalGroupXLock *lock = &entry->group_locks[group_id];
+  uint64_t t0 = now_us();
+
+  if (valid_app_tid(tid)) {
+    group_lock_acquire_cnt[tid]++;
+  }
+
+  // Fast path: same semantics as a simple exclusive lock word: 0 = unlocked,
+  // 1 = locked.  Unlike the old ticket lock, this has no FIFO handoff.
+  uint64_t expected = 0;
+  if (lock->word.compare_exchange_strong(expected, 1,
+                                         std::memory_order_acq_rel,
+                                         std::memory_order_acquire)) {
+    return;
+  }
+
+  // Slow path: record the current number of local waiters.  This is not a
+  // strict queue depth, because this lock is intentionally non-FIFO.
+  uint32_t waiter_depth =
+      lock->waiters.fetch_add(1, std::memory_order_acq_rel) + 1;
+  if (valid_app_tid(tid)) {
+    group_lock_wait_event_cnt[tid]++;
+    group_lock_qdepth_sum[tid] += waiter_depth;
+    update_max_u64(group_lock_qdepth_max[tid], waiter_depth);
+  }
+
+  auto can_retry = [lock]() {
+    return lock->word.load(std::memory_order_acquire) == 0;
+  };
+
+  while (true) {
+    expected = 0;
+    if (lock->word.compare_exchange_weak(expected, 1,
+                                         std::memory_order_acq_rel,
+                                         std::memory_order_acquire)) {
+      break;
+    }
+
+    if (valid_app_tid(tid)) {
+      group_lock_wait_yield_cnt[tid]++;
+    }
+
+    if (ctx != nullptr && ctx->busy_waiting_queue != nullptr) {
+      ctx->busy_waiting_queue->push(std::make_pair(ctx->coro_id, can_retry));
+      (*ctx->yield)(*ctx->master);
+    } else {
+      _mm_pause();
+    }
+  }
+
+  lock->waiters.fetch_sub(1, std::memory_order_acq_rel);
+
+  uint64_t wait_us = now_us() - t0;
+  if (valid_app_tid(tid) && wait_us > 0) {
+    group_lock_wait_us_sum[tid] += wait_us;
+    update_max_u64(group_lock_wait_us_max[tid], wait_us);
+  }
+}
+
+inline void release_local_group_x_lock(LeafSplitGuardEntry *entry,
+                                       int group_id) {
+  assert(group_id >= 0 && group_id < kNumGroup);
+
+  LocalGroupXLock *lock = &entry->group_locks[group_id];
+  lock->word.store(0, std::memory_order_release);
+}
+
+inline bool enter_leaf_group_write_region(DSMClient *dsm_client,
+                                          GlobalAddress page_addr,
+                                          int group_id,
+                                          CoroContext *ctx,
+                                          LeafSplitGuardEntry **entry_out,
+                                          uint16_t tid) {
+  LeafSplitGuardEntry *entry = get_leaf_split_guard_entry(page_addr);
+
+  acquire_local_group_x_lock(entry, group_id, ctx, tid);
+
+  if (!enter_leaf_split_guard(dsm_client, page_addr)) {
+    release_local_group_x_lock(entry, group_id);
+    return false;
+  }
+
+  if (entry_out != nullptr) {
+    *entry_out = entry;
+  }
+  return true;
+}
+
+inline void wait_until_enter_leaf_group_write_region(
+    DSMClient *dsm_client,
+    GlobalAddress page_addr,
+    int group_id,
+    CoroContext *ctx,
+    LeafSplitGuardEntry **entry_out,
+    uint16_t tid) {
+  while (!enter_leaf_group_write_region(dsm_client, page_addr, group_id,
+                                        ctx, entry_out, tid)) {
+    if (ctx != nullptr && ctx->busy_waiting_queue != nullptr) {
+      ctx->busy_waiting_queue->push(
+          std::make_pair(ctx->coro_id, []() { return true; }));
+      (*ctx->yield)(*ctx->master);
+    } else {
+      _mm_pause();
+    }
+  }
+}
+
+inline void leave_leaf_group_write_region(DSMClient *dsm_client,
+                                          GlobalAddress page_addr,
+                                          int group_id,
+                                          LeafSplitGuardEntry *entry) {
+  leave_leaf_split_guard(dsm_client, page_addr);
+  release_local_group_x_lock(entry, group_id);
+}
+#endif
+inline uint32_t begin_leaf_split_guard(DSMClient *dsm_client,
+                                      GlobalAddress page_addr,
+                                      CoroContext *ctx) {
+  uint64_t page_sig = get_leaf_page_sig(page_addr);
+  uint32_t generation =
+      leaf_split_guard_generation.fetch_add(1, std::memory_order_acq_rel) + 1;
+
+  uint16_t tid = dsm_client->get_my_thread_id();
+  if (valid_app_tid(tid)) {
+    split_guard_begin_cnt[tid]++;
+  }
+
+  apply_leaf_split_guard_block(page_addr, dsm_client->get_my_client_id(),
+                                leaf_split_guard_control_app_id(), generation);
+
+  uint32_t expected_acks =
+      dsm_client->get_client_size() > 0 ? dsm_client->get_client_size() - 1 : 0;
+  register_split_guard_ack_state(page_sig, generation);
+  if (expected_acks > 0) {
+    send_leaf_split_guard_message(dsm_client, RpcType::SPLIT_GUARD_BLOCK,
+                                  page_addr, page_sig, generation);
+  }
+
+  if (ctx != nullptr) {
+    LeafSplitGuardEntry *entry = get_leaf_split_guard_entry(page_addr);
+
+    uint64_t wait_start_us = now_us();
+    uint64_t wait_inflight_us = 0;
+    uint64_t wait_ack_us = 0;
+    uint64_t wait_both_us = 0;
+    uint64_t wait_yields = 0;
+    uint32_t max_inflight = 0;
+    bool waited = false;
+
+    auto guard_ready = [=]() {
+      return entry->inflight.load(std::memory_order_acquire) == 0 &&
+             split_guard_ack_state_ready(page_sig, generation, expected_acks);
+    };
+
+    while (!guard_ready()) {
+      uint64_t iter_start_us = now_us();
+
+      uint32_t inflight =
+          entry->inflight.load(std::memory_order_acquire);
+      bool inflight_blocked = inflight != 0;
+      bool ack_blocked =
+          !split_guard_ack_state_ready(page_sig, generation, expected_acks);
+
+      if (inflight > max_inflight) {
+        max_inflight = inflight;
+      }
+
+      waited = true;
+      ++wait_yields;
+
+      if (ctx->busy_waiting_queue != nullptr) {
+        ctx->busy_waiting_queue->push(
+            std::make_pair(ctx->coro_id, guard_ready));
+        (*ctx->yield)(*ctx->master);
+      } else {
+        _mm_pause();
+      }
+
+      uint64_t iter_us = now_us() - iter_start_us;
+      if (inflight_blocked && ack_blocked) {
+        wait_both_us += iter_us;
+      } else if (inflight_blocked) {
+        wait_inflight_us += iter_us;
+      } else if (ack_blocked) {
+        wait_ack_us += iter_us;
+      }
+    }
+
+    uint64_t total_wait_us = now_us() - wait_start_us;
+    if (valid_app_tid(tid)) {
+      if (waited) {
+        split_guard_wait_event_cnt[tid]++;
+      }
+      split_guard_wait_yield_cnt[tid] += wait_yields;
+      split_guard_wait_us_sum[tid] += total_wait_us;
+      split_guard_wait_inflight_us_sum[tid] += wait_inflight_us;
+      split_guard_wait_ack_us_sum[tid] += wait_ack_us;
+      split_guard_wait_both_us_sum[tid] += wait_both_us;
+      update_max_u64(split_guard_wait_us_max[tid], total_wait_us);
+      update_max_u64(split_guard_inflight_max[tid], max_inflight);
+    }
+
+    unregister_split_guard_ack_state(page_sig, generation);
+    return generation;
+  }
+
+  uint32_t ack_count = 0;
+  uint64_t ack_node_mask = 0;
+  LeafSplitGuardEntry *entry = get_leaf_split_guard_entry(page_addr);
+
+  uint64_t wait_start_us = now_us();
+  uint64_t wait_inflight_us = 0;
+  uint64_t wait_ack_us = 0;
+  uint64_t wait_both_us = 0;
+  uint64_t wait_iters = 0;
+  uint32_t max_inflight = 0;
+  bool waited = false;
+
+  while (true) {
+    uint64_t iter_start_us = now_us();
+
+    uint32_t inflight = entry->inflight.load(std::memory_order_acquire);
+    bool inflight_blocked = inflight != 0;
+    bool ack_blocked =
+        !split_guard_ack_state_ready(page_sig, generation, expected_acks);
+
+    if (!inflight_blocked && !ack_blocked) {
+      break;
+    }
+
+    waited = true;
+    ++wait_iters;
+    if (inflight > max_inflight) {
+      max_inflight = inflight;
+    }
+
+    RawMessage msg;
+    if (dsm_client->PollRpcCqOnce(msg)) {
+      handle_leaf_split_guard_message(dsm_client, msg, page_sig, generation,
+                                      &ack_count, &ack_node_mask);
+      flush_pending_leaf_split_guard_acks(dsm_client);
+    } else {
+      flush_pending_leaf_split_guard_acks(dsm_client);
+      _mm_pause();
+    }
+
+    uint64_t iter_us = now_us() - iter_start_us;
+    if (inflight_blocked && ack_blocked) {
+      wait_both_us += iter_us;
+    } else if (inflight_blocked) {
+      wait_inflight_us += iter_us;
+    } else if (ack_blocked) {
+      wait_ack_us += iter_us;
+    }
+  }
+
+  uint64_t total_wait_us = now_us() - wait_start_us;
+  if (valid_app_tid(tid)) {
+    if (waited) {
+      split_guard_wait_event_cnt[tid]++;
+    }
+    split_guard_wait_yield_cnt[tid] += wait_iters;
+    split_guard_wait_us_sum[tid] += total_wait_us;
+    split_guard_wait_inflight_us_sum[tid] += wait_inflight_us;
+    split_guard_wait_ack_us_sum[tid] += wait_ack_us;
+    split_guard_wait_both_us_sum[tid] += wait_both_us;
+    update_max_u64(split_guard_wait_us_max[tid], total_wait_us);
+    update_max_u64(split_guard_inflight_max[tid], max_inflight);
+  }
+
+  unregister_split_guard_ack_state(page_sig, generation);
+  return generation;
 }
 
 inline void end_leaf_split_guard(DSMClient *dsm_client, GlobalAddress page_addr,
@@ -1612,6 +2122,170 @@ void Tree::print_lock_stats() {
     // 如果你有统计总的 operations 或者有用的 RDMA 次数，可以在这里算个占比
     // 比如：double overhead_ratio = (double)total_lock_rdma / (total_lock_rdma + valid_rdma_ops);
     printf("================================\n");
+
+  uint64_t total_group_lock_acquire = 0;
+  uint64_t total_group_lock_wait_event = 0;
+  uint64_t total_group_lock_wait_yield = 0;
+  uint64_t total_group_lock_wait_us = 0;
+  uint64_t max_group_lock_wait_us = 0;
+  uint64_t total_group_lock_qdepth = 0;
+  uint64_t max_group_lock_qdepth = 0;
+  uint64_t total_local_group_wc_owner = 0;
+  uint64_t total_local_group_wc_waiter = 0;
+  uint64_t total_local_group_wc_waiter_return = 0;
+  uint64_t total_local_group_wc_apply = 0;
+  uint64_t total_local_group_wc_nochange = 0;
+  uint64_t total_local_group_wc_replace = 0;
+  uint64_t total_local_group_wc_bypass = 0;
+
+  uint64_t total_split_guard_begin = 0;
+  uint64_t total_split_guard_wait_event = 0;
+  uint64_t total_split_guard_wait_yield = 0;
+  uint64_t total_split_guard_wait_us = 0;
+  uint64_t max_split_guard_wait_us = 0;
+  uint64_t total_split_guard_wait_inflight_us = 0;
+  uint64_t total_split_guard_wait_ack_us = 0;
+  uint64_t total_split_guard_wait_both_us = 0;
+  uint64_t max_split_guard_inflight = 0;
+
+  for (int t = 0; t < MAX_APP_THREAD; ++t) {
+    total_group_lock_acquire += group_lock_acquire_cnt[t];
+    total_group_lock_wait_event += group_lock_wait_event_cnt[t];
+    total_group_lock_wait_yield += group_lock_wait_yield_cnt[t];
+    total_group_lock_wait_us += group_lock_wait_us_sum[t];
+    total_group_lock_qdepth += group_lock_qdepth_sum[t];
+    if (group_lock_wait_us_max[t] > max_group_lock_wait_us) {
+      max_group_lock_wait_us = group_lock_wait_us_max[t];
+    }
+    if (group_lock_qdepth_max[t] > max_group_lock_qdepth) {
+      max_group_lock_qdepth = group_lock_qdepth_max[t];
+    }
+    total_local_group_wc_owner += local_group_wc_owner_cnt[t];
+    total_local_group_wc_waiter += local_group_wc_waiter_cnt[t];
+    total_local_group_wc_waiter_return += local_group_wc_waiter_return_cnt[t];
+    total_local_group_wc_apply += local_group_wc_apply_cnt[t];
+    total_local_group_wc_nochange += local_group_wc_nochange_cnt[t];
+    total_local_group_wc_replace += local_group_wc_replace_cnt[t];
+    total_local_group_wc_bypass += local_group_wc_bypass_cnt[t];
+
+    total_split_guard_begin += split_guard_begin_cnt[t];
+    total_split_guard_wait_event += split_guard_wait_event_cnt[t];
+    total_split_guard_wait_yield += split_guard_wait_yield_cnt[t];
+    total_split_guard_wait_us += split_guard_wait_us_sum[t];
+    total_split_guard_wait_inflight_us += split_guard_wait_inflight_us_sum[t];
+    total_split_guard_wait_ack_us += split_guard_wait_ack_us_sum[t];
+    total_split_guard_wait_both_us += split_guard_wait_both_us_sum[t];
+    if (split_guard_wait_us_max[t] > max_split_guard_wait_us) {
+      max_split_guard_wait_us = split_guard_wait_us_max[t];
+    }
+    if (split_guard_inflight_max[t] > max_split_guard_inflight) {
+      max_split_guard_inflight = split_guard_inflight_max[t];
+    }
+  }
+
+  double avg_group_lock_wait_us =
+      total_group_lock_acquire == 0
+          ? 0.0
+          : static_cast<double>(total_group_lock_wait_us) /
+                total_group_lock_acquire;
+  double avg_group_lock_qdepth =
+      total_group_lock_acquire == 0
+          ? 0.0
+          : static_cast<double>(total_group_lock_qdepth) /
+                total_group_lock_acquire;
+
+  double avg_split_guard_wait_us =
+      total_split_guard_begin == 0
+          ? 0.0
+          : static_cast<double>(total_split_guard_wait_us) /
+                total_split_guard_begin;
+
+  printf("\n=== Local Group Lock Stats ===\n");
+  printf("  Acquires:             %llu\n",
+         (unsigned long long)total_group_lock_acquire);
+  printf("  Wait events:          %llu\n",
+         (unsigned long long)total_group_lock_wait_event);
+  printf("  Wait yields:          %llu\n",
+         (unsigned long long)total_group_lock_wait_yield);
+  printf("  Avg wait:             %.3f us / acquire\n",
+         avg_group_lock_wait_us);
+  printf("  Max wait:             %llu us\n",
+         (unsigned long long)max_group_lock_wait_us);
+  printf("  Avg queue depth:      %.3f\n", avg_group_lock_qdepth);
+  printf("  Max queue depth:      %llu\n",
+         (unsigned long long)max_group_lock_qdepth);
+
+  printf("\n=== Local Group Write Combine Stats ===\n");
+  printf("  Owner entries:        %llu\n",
+         (unsigned long long)total_local_group_wc_owner);
+  printf("  Waiter entries:       %llu\n",
+         (unsigned long long)total_local_group_wc_waiter);
+  printf("  Waiter direct returns:%llu\n",
+         (unsigned long long)total_local_group_wc_waiter_return);
+  printf("  Applied values:       %llu\n",
+         (unsigned long long)total_local_group_wc_apply);
+  printf("  No-change applies:    %llu\n",
+         (unsigned long long)total_local_group_wc_nochange);
+  printf("  Slot replacements:    %llu\n",
+         (unsigned long long)total_local_group_wc_replace);
+  printf("  Bypass entries:       %llu\n",
+         (unsigned long long)total_local_group_wc_bypass);
+
+  printf("\n=== Split Guard Wait Stats ===\n");
+  printf("  Begin count:          %llu\n",
+         (unsigned long long)total_split_guard_begin);
+  printf("  Wait events:          %llu\n",
+         (unsigned long long)total_split_guard_wait_event);
+  printf("  Wait yields/iters:    %llu\n",
+         (unsigned long long)total_split_guard_wait_yield);
+  printf("  Avg total wait:       %.3f us / begin\n",
+         avg_split_guard_wait_us);
+  printf("  Max total wait:       %llu us\n",
+         (unsigned long long)max_split_guard_wait_us);
+  printf("  Wait inflight only:   %llu us\n",
+         (unsigned long long)total_split_guard_wait_inflight_us);
+  printf("  Wait ACK only:        %llu us\n",
+         (unsigned long long)total_split_guard_wait_ack_us);
+  printf("  Wait both:            %llu us\n",
+         (unsigned long long)total_split_guard_wait_both_us);
+  printf("  Max inflight seen:    %llu\n",
+         (unsigned long long)max_split_guard_inflight);
+
+  uint64_t ack_after_wait =
+      split_guard_ack_sent_after_wait_cnt.load(std::memory_order_relaxed);
+  double avg_ack_queue_wait_us =
+      ack_after_wait == 0
+          ? 0.0
+          : static_cast<double>(
+                split_guard_ack_queue_wait_us_sum.load(
+                    std::memory_order_relaxed)) /
+                ack_after_wait;
+
+  printf("\n=== Split Guard ACK Delay Stats ===\n");
+  printf("  Immediate ACKs:       %llu\n",
+         (unsigned long long)split_guard_ack_immediate_cnt.load(
+             std::memory_order_relaxed));
+  printf("  Queued ACKs:          %llu\n",
+         (unsigned long long)split_guard_ack_queued_cnt.load(
+             std::memory_order_relaxed));
+  printf("  ACKs after wait:      %llu\n",
+         (unsigned long long)ack_after_wait);
+  printf("  Flush blocked checks: %llu\n",
+         (unsigned long long)split_guard_ack_flush_blocked_cnt.load(
+             std::memory_order_relaxed));
+  printf("  Avg ACK queue wait:   %.3f us\n",
+         avg_ack_queue_wait_us);
+  printf("  Max ACK queue wait:   %llu us\n",
+         (unsigned long long)split_guard_ack_queue_wait_us_max.load(
+             std::memory_order_relaxed));
+  printf("  Max pending ACKs:     %llu\n",
+         (unsigned long long)split_guard_ack_pending_max.load(
+             std::memory_order_relaxed));
+  printf("  Max blocking inflight:%llu\n",
+         (unsigned long long)split_guard_ack_blocking_inflight_max.load(
+             std::memory_order_relaxed));
+  printf("================================\n");
+
   uint64_t total_insert_rtt = 0, total_insert_bytes = 0, total_insert_ops = 0;
   uint64_t total_search_rtt = 0, total_search_bytes = 0, total_search_ops = 0;
   uint64_t total_leaf_update_hit = 0, total_leaf_insert_empty = 0;
@@ -3844,17 +4518,45 @@ bool Tree::leaf_page_store(GlobalAddress page_addr, const Key &k,
     track_rdma(tid, 1, sizeof(uint64_t));
     return cas_ok;
   };
-#if defined(USE_SPLIT_ONLY_X_LOCK)
+#if defined(USE_LOCAL_GROUP_X_LOCK)
+  bool leaf_write_guard_active = false;
+  LeafSplitGuardEntry *leaf_write_guard_entry = nullptr;
+
+  auto enter_leaf_write_guard = [&]() {
+    if (share_lock && !leaf_write_guard_active) {
+      wait_until_enter_leaf_group_write_region(
+          dsm_client_, page_addr, group_id, ctx, &leaf_write_guard_entry, tid);
+      leaf_write_guard_active = true;
+    }
+  };
+
+  auto leave_leaf_write_guard = [&]() {
+    if (leaf_write_guard_active) {
+      leave_leaf_group_write_region(dsm_client_, page_addr, group_id,
+                                    leaf_write_guard_entry);
+      leaf_write_guard_active = false;
+      leaf_write_guard_entry = nullptr;
+    }
+  };
+
+  auto finish_leaf_access = [&](bool async) {
+    if (share_lock) {
+      leave_leaf_write_guard();
+    } else {
+      release_lock(lock_addr, lock_buffer, ctx, async, false);
+    }
+  };
+#elif defined(USE_SPLIT_ONLY_X_LOCK)
   bool leaf_read_guard_active = false;
 
-  auto enter_leaf_read_guard = [&]() {
+  auto enter_leaf_write_guard = [&]() {
     if (share_lock && !leaf_read_guard_active) {
       wait_until_enter_leaf_split_guard(dsm_client_, page_addr, ctx);
       leaf_read_guard_active = true;
     }
   };
 
-  auto leave_leaf_read_guard = [&]() {
+  auto leave_leaf_write_guard = [&]() {
     if (leaf_read_guard_active) {
       leave_leaf_split_guard(dsm_client_, page_addr);
       leaf_read_guard_active = false;
@@ -3863,14 +4565,14 @@ bool Tree::leaf_page_store(GlobalAddress page_addr, const Key &k,
 
   auto finish_leaf_access = [&](bool async) {
     if (share_lock) {
-      leave_leaf_read_guard();
+      leave_leaf_write_guard();
     } else {
       release_lock(lock_addr, lock_buffer, ctx, async, false);
     }
   };
 #else
-  auto enter_leaf_read_guard = [&]() {};
-  auto leave_leaf_read_guard = [&]() {};
+  auto enter_leaf_write_guard = [&]() {};
+  auto leave_leaf_write_guard = [&]() {};
   auto finish_leaf_access = [&](bool async) {
     release_lock(lock_addr, lock_buffer, ctx, async, share_lock);
   };
@@ -3908,22 +4610,74 @@ bool Tree::leaf_page_store(GlobalAddress page_addr, const Key &k,
   for (uint32_t optimistic_retry = 0;
       !bypass_optimistic_leaf_fast_path;
       ++optimistic_retry) {
+#ifdef USE_LOCAL_GROUP_X_LOCK
+    LeafSplitGuardEntry *optimistic_group_guard_entry = nullptr;
+#ifdef USE_LOCAL_GROUP_WRITE_COMBINE
+    LocalGroupWriteCombineToken optimistic_wc_token =
+        begin_local_group_write_combine(get_leaf_split_guard_entry(page_addr),
+                                        group_id, k, v, tid);
+    if (optimistic_wc_token.valid && !optimistic_wc_token.owner) {
+      wait_for_local_group_write_combine(optimistic_wc_token, ctx);
+      if (valid_app_tid(tid)) {
+        local_group_wc_waiter_return_cnt[tid]++;
+      }
+      return true;
+    }
+#endif
+    wait_until_enter_leaf_group_write_region(
+        dsm_client_, page_addr, group_id, ctx, &optimistic_group_guard_entry, tid);
+#else
     wait_until_enter_leaf_split_guard(dsm_client_, page_addr, ctx);
+#endif
+    
 #else
   for (int optimistic_retry = 0;
       !bypass_optimistic_leaf_fast_path &&
       optimistic_retry < kOptimisticUpdateRetry;
       ++optimistic_retry) {
+#ifdef USE_LOCAL_GROUP_X_LOCK
+    LeafSplitGuardEntry *optimistic_group_guard_entry = nullptr;
+#ifdef USE_LOCAL_GROUP_WRITE_COMBINE
+    LocalGroupWriteCombineToken optimistic_wc_token =
+        begin_local_group_write_combine(get_leaf_split_guard_entry(page_addr),
+                                        group_id, k, v, tid);
+    if (optimistic_wc_token.valid && !optimistic_wc_token.owner) {
+      wait_for_local_group_write_combine(optimistic_wc_token, ctx);
+      if (valid_app_tid(tid)) {
+        local_group_wc_waiter_return_cnt[tid]++;
+      }
+      return true;
+    }
+#endif
+    if (!enter_leaf_group_write_region(dsm_client_, page_addr, group_id, ctx,
+                                       &optimistic_group_guard_entry, tid)) {
+#ifdef USE_LOCAL_GROUP_WRITE_COMBINE
+      finish_local_group_write_combine(optimistic_wc_token);
+#endif
+      optimistic_insert_consistency_fail_cnt[tid]++;
+      mark_hot_leaf_fast_path_conflict(page_addr);
+      break;
+    }
+#else
     if (!enter_leaf_split_guard(dsm_client_, page_addr)) {
       optimistic_insert_consistency_fail_cnt[tid]++;
       mark_hot_leaf_fast_path_conflict(page_addr);
       break;
     }
 #endif
+#endif
     bool optimistic_guard_active = true;
     auto leave_optimistic_guard = [&]() {
       if (optimistic_guard_active) {
+#ifdef USE_LOCAL_GROUP_X_LOCK
+        leave_leaf_group_write_region(dsm_client_, page_addr, group_id,
+                                      optimistic_group_guard_entry);
+#ifdef USE_LOCAL_GROUP_WRITE_COMBINE
+        finish_local_group_write_combine(optimistic_wc_token);
+#endif
+#else
         leave_leaf_split_guard(dsm_client_, page_addr);
+#endif
         optimistic_guard_active = false;
       }
     };
@@ -3958,24 +4712,33 @@ bool Tree::leaf_page_store(GlobalAddress page_addr, const Key &k,
     if (!optimistic_update_candidate) {
       // try optimistic empty-slot insert before taking a leaf lock
       if (insert_addr != nullptr) {
-#if KEY_SIZE == 8
+    #if KEY_SIZE == 8
         optimistic_insert_attempt_cnt[tid]++;
+
+        Value combined_insert_value = v;
+#if defined(USE_LOCAL_GROUP_X_LOCK) && defined(USE_LOCAL_GROUP_WRITE_COMBINE)
+        consume_local_group_write_combine(optimistic_group_guard_entry,
+                                          group_id, k,
+                                          combined_insert_value, tid);
+#endif
         uint64_t *swap_buffer = rbuf.get_cas_buffer();
         LeafEntry *swap_entry = reinterpret_cast<LeafEntry *>(swap_buffer);
         swap_entry->key = k;
         swap_entry->lv.cl_ver = insert_addr->lv.cl_ver;
-        swap_entry->lv.val = v;
+        swap_entry->lv.val = combined_insert_value;
 
         uint64_t *mask_buffer = rbuf.get_cas_buffer();
         mask_buffer[0] = mask_buffer[1] = ~0ull;
-        bool cas_ok = dsm_client_->CasMaskSync(
-            GADD(page_addr, reinterpret_cast<char *>(insert_addr) -
-                            page_buffer),
+
+        bool insert_cas_ok = dsm_client_->CasMaskSync(
+            GADD(page_addr, reinterpret_cast<char *>(insert_addr) - page_buffer),
             4, reinterpret_cast<uint64_t>(insert_addr),
             reinterpret_cast<uint64_t>(swap_buffer), cas_ret_buffer,
             reinterpret_cast<uint64_t>(mask_buffer), ctx);
+
         track_rdma(tid, 1, sizeof(LeafEntry));
-        if (cas_ok || (__bswap_64(cas_ret_buffer[0]) == k)) {
+
+        if (insert_cas_ok || (__bswap_64(cas_ret_buffer[0]) == k)) {
           optimistic_insert_success_cnt[tid]++;
           leaf_insert_empty_cnt[tid]++;
           insert_addr->key = k;
@@ -3985,22 +4748,32 @@ bool Tree::leaf_page_store(GlobalAddress page_addr, const Key &k,
           leave_optimistic_guard();
           return true;
         }
+
         optimistic_insert_cas_fail_cnt[tid]++;
         record_hot_leaf_cas_fail(page_addr, tid);
         mark_hot_leaf_fast_path_conflict(page_addr);
+
+        // big-endian for 16-byte CAS return
         insert_addr->key = __bswap_64(cas_ret_buffer[0]);
         insert_addr->lv.raw = __bswap_64(cas_ret_buffer[1]);
-        leave_optimistic_guard();
-#ifdef USE_OPTIMISTIC_GUARD_RETRY
-        if (++optimistic_insert_retry_cnt > kOptimisticInsertRetry) {
-          optimistic_insert_fallback_cnt[tid]++;
+
+    #ifdef USE_OPTIMISTIC_GUARD_RETRY
+        if (++optimistic_insert_retry_cnt <= kOptimisticInsertRetry) {
           leave_optimistic_guard();
-          break;
+          continue;
         }
-#endif
+    #endif
+
+        optimistic_insert_fallback_cnt[tid]++;
         leave_optimistic_guard();
-#endif
+        break;
+    #else
+        optimistic_insert_fallback_cnt[tid]++;
+        leave_optimistic_guard();
+        break;
+    #endif
       }
+
       optimistic_insert_fallback_cnt[tid]++;
       leave_optimistic_guard();
       break;
@@ -4008,12 +4781,17 @@ bool Tree::leaf_page_store(GlobalAddress page_addr, const Key &k,
 
     optimistic_update_attempt_cnt[tid]++;
 
-    LeafValue cas_val(update_addr->lv.cl_ver, v);
-    bool cas_ok = dsm_client_->CasSync(
+    Value combined_update_value = v;
+#if defined(USE_LOCAL_GROUP_X_LOCK) && defined(USE_LOCAL_GROUP_WRITE_COMBINE)
+    consume_local_group_write_combine(optimistic_group_guard_entry, group_id,
+                                      k, combined_update_value, tid);
+#endif
+    LeafValue cas_val(update_addr->lv.cl_ver, combined_update_value);
+    bool update_cas_ok = dsm_client_->CasSync(
         GADD(page_addr, ((char *)&update_addr->lv - page_buffer)),
         update_addr->lv.raw, cas_val.raw, cas_ret_buffer, ctx);
     track_rdma(tid, 1, sizeof(LeafValue));
-    if (!cas_ok) {
+    if (!update_cas_ok) {
       // Match the normal SXLOCK update path: do not retry update CAS.
       // Treat the operation as complete after the single CAS attempt.
       optimistic_update_cas_fail_cnt[tid]++;
@@ -4031,7 +4809,7 @@ bool Tree::leaf_page_store(GlobalAddress page_addr, const Key &k,
   }
 #endif
 #ifdef USE_SPLIT_ONLY_X_LOCK
-  enter_leaf_read_guard();
+  enter_leaf_write_guard();
 #endif
   // 1. lock, read, and check consistency
   lock_and_read(lock_addr, share_lock, false, lock_buffer,
@@ -4109,10 +4887,10 @@ retry_insert:
 #endif
   if (update_addr) {
     LeafValue cas_val(update_addr->lv.cl_ver, v);
-    bool cas_ok = sxlock_leaf_value_cas(
+    bool update_cas_ok = sxlock_leaf_value_cas(
         GADD(page_addr, ((char *)&update_addr->lv - page_buffer)),
         update_addr->lv.raw, cas_val.raw);
-    if (cas_ok) {
+    if (update_cas_ok) {
       leaf_update_hit_cnt[tid]++;
       record_hot_leaf_update_success(page_addr, tid);
 #ifdef USE_SPLIT_ONLY_X_LOCK
@@ -4144,12 +4922,12 @@ retry_insert:
     swap_entry->lv.val = v;
     uint64_t *mask_buffer = rbuf.get_cas_buffer();
     mask_buffer[0] = mask_buffer[1] = ~0ull;
-    bool cas_ok = dsm_client_->CasMaskSync(
+    bool insert_cas_ok = dsm_client_->CasMaskSync(
         GADD(page_addr, ((char *)insert_addr - page_buffer)), 4,
         (uint64_t)insert_addr, (uint64_t)swap_buffer, cas_ret_buffer,
         (uint64_t)mask_buffer, ctx);
     // cas succeed or same key inserted by other thread
-    if (cas_ok || (__bswap_64(cas_ret_buffer[0]) == k)) {
+    if (insert_cas_ok || (__bswap_64(cas_ret_buffer[0]) == k)) {
       leaf_insert_empty_cnt[tid]++;
       insert_addr->key = k;
       insert_addr->lv.cl_ver = swap_entry->lv.cl_ver;
@@ -4204,7 +4982,7 @@ retry_insert:
   // Leave the split-read guard first; begin_leaf_split_guard() waits for
   // inflight readers to drain, so holding this guard here would self-block.
   if (share_lock) {
-    leave_leaf_read_guard();
+    leave_leaf_write_guard();
   }
   upgrade_from_s = false;
   share_lock = false;
@@ -4227,7 +5005,7 @@ retry_with_xlock:
   } else {
     // not holding lock, or only share lock
 #if defined(USE_SPLIT_ONLY_X_LOCK)
-    enter_leaf_read_guard();
+    enter_leaf_write_guard();
 #endif
     lock_and_read(lock_addr, share_lock, upgrade_from_s, lock_buffer, page_addr,
                   kLeafPageSize, page_buffer, ctx);
@@ -4298,10 +5076,10 @@ retry_insert_2:
     }
 #else
     {
-      bool cas_ok = sxlock_leaf_value_cas(
+      bool update_cas_ok = sxlock_leaf_value_cas(
           GADD(page_addr, ((char *)&(update_addr->lv) - page_buffer)),
           update_addr->lv.raw, cas_val.raw);
-      if (cas_ok) {
+      if (update_cas_ok) {
         leaf_update_hit_cnt[tid]++;
         record_hot_leaf_update_success(page_addr, tid);
 #ifdef USE_SPLIT_ONLY_X_LOCK
@@ -4334,12 +5112,12 @@ retry_insert_2:
     swap_entry->lv.val = v;
     uint64_t *mask_buffer = rbuf.get_cas_buffer();
     mask_buffer[0] = mask_buffer[1] = ~0ull;
-    bool cas_ok = dsm_client_->CasMaskSync(
+    bool insert_cas_ok = dsm_client_->CasMaskSync(
         GADD(page_addr, ((char *)insert_addr - page_buffer)), 4,
         (uint64_t)insert_addr, (uint64_t)swap_buffer, cas_ret_buffer,
         (uint64_t)mask_buffer, ctx);
     // cas succeed or same key inserted by other thread
-    if (cas_ok || (__bswap_64(cas_ret_buffer[0]) == k)) {
+    if (insert_cas_ok || (__bswap_64(cas_ret_buffer[0]) == k)) {
       leaf_insert_empty_cnt[tid]++;
       insert_addr->key = k;
       insert_addr->lv.cl_ver = swap_entry->lv.cl_ver;
@@ -4390,7 +5168,7 @@ retry_insert_2:
   // should hold x lock
 #if defined(USE_SPLIT_ONLY_X_LOCK)
   if (share_lock) {
-    leave_leaf_read_guard();
+    leave_leaf_write_guard();
     upgrade_from_s = false;
     share_lock = false;
     goto retry_with_xlock;
@@ -4619,7 +5397,6 @@ retry_insert_2:
 
   return res;
 }
-
 bool Tree::leaf_page_del(GlobalAddress page_addr, const Key &k, int level,
                         CoroContext *ctx, int coro_id, bool from_cache) {
   GlobalAddress lock_addr = get_lock_addr(page_addr);
@@ -5129,9 +5906,47 @@ for (int i = 0; i < MAX_APP_THREAD; ++i) {
     search_rtt_cnt[i][0] = 0;
     search_byte_cnt[i][0] = 0;
     search_op_cnt[i][0] = 0;
+
+    group_lock_acquire_cnt[i] = 0;
+    group_lock_wait_event_cnt[i] = 0;
+    group_lock_wait_yield_cnt[i] = 0;
+    group_lock_wait_us_sum[i] = 0;
+    group_lock_wait_us_max[i] = 0;
+    group_lock_qdepth_sum[i] = 0;
+    group_lock_qdepth_max[i] = 0;
+    local_group_wc_owner_cnt[i] = 0;
+    local_group_wc_waiter_cnt[i] = 0;
+    local_group_wc_waiter_return_cnt[i] = 0;
+    local_group_wc_apply_cnt[i] = 0;
+    local_group_wc_nochange_cnt[i] = 0;
+    local_group_wc_replace_cnt[i] = 0;
+    local_group_wc_bypass_cnt[i] = 0;
+
+    split_guard_begin_cnt[i] = 0;
+    split_guard_wait_event_cnt[i] = 0;
+    split_guard_wait_yield_cnt[i] = 0;
+    split_guard_wait_us_sum[i] = 0;
+    split_guard_wait_us_max[i] = 0;
+    split_guard_wait_inflight_us_sum[i] = 0;
+    split_guard_wait_ack_us_sum[i] = 0;
+    split_guard_wait_both_us_sum[i] = 0;
+    split_guard_inflight_max[i] = 0;
     for (int k = 0; k <= 5000; ++k) {
       tries_per_lock[i][k] = 0;
     }
+  }
+
+  split_guard_ack_immediate_cnt.store(0, std::memory_order_relaxed);
+  split_guard_ack_queued_cnt.store(0, std::memory_order_relaxed);
+  split_guard_ack_sent_after_wait_cnt.store(0, std::memory_order_relaxed);
+  split_guard_ack_flush_blocked_cnt.store(0, std::memory_order_relaxed);
+  split_guard_ack_queue_wait_us_sum.store(0, std::memory_order_relaxed);
+  split_guard_ack_queue_wait_us_max.store(0, std::memory_order_relaxed);
+  split_guard_ack_pending_max.store(0, std::memory_order_relaxed);
+  split_guard_ack_blocking_inflight_max.store(0, std::memory_order_relaxed);
+  {
+    std::lock_guard<std::mutex> lock(pending_leaf_split_guard_acks_mutex);
+    pending_leaf_split_guard_acks.clear();
   }
 }
 void Tree::microbench_op(CoroContext *ctx, int coro_id, bool is_search, Key k) {
