@@ -98,12 +98,6 @@ struct SearchResult {
 };
 
 constexpr int kMaxInternalGroup = 4;
-constexpr uint64_t kNodeControlVersionMask = (1ull << 56) - 1;
-constexpr uint64_t kNodeControlLockedBit = 1ull << 56;
-constexpr uint64_t kNodeControlSplittingBit = 1ull << 57;
-constexpr uint64_t kNodeControlDeletedBit = 1ull << 58;
-constexpr uint64_t kNodeControlSiblingBit = 1ull << 59;
-
 struct alignas(64) Header {
   uint32_t crc;
   uint8_t padding[kHeaderSize - kHeaderRawSize];
@@ -114,10 +108,7 @@ struct alignas(64) Header {
   uint8_t is_root : 1;  
   uint8_t cache_read_gran[kMaxInternalGroup];  // used in cache
   uint8_t grp_in_cache[kMaxInternalGroup];     // used in cache
-  union {
-    uint64_t index_cache_freq;
-    uint64_t control_word;
-  };
+  uint64_t index_cache_freq;
   GlobalAddress my_addr = GlobalAddress::Null();
 
   GlobalAddress sibling_ptr = GlobalAddress::Null();
@@ -413,21 +404,11 @@ class InternalPage {
 // LeafEntry Group in leaf page
 
 constexpr int kAssociativity = 4;
-#ifdef USE_LEAF_STASH
-constexpr int kGroupOverflowSlots = kAssociativity - 1;
-#else
 constexpr int kGroupOverflowSlots = kAssociativity;
-#endif
 constexpr int kNumBucket = 10;
 constexpr int kNumGroup = kNumBucket / 2;
-#ifdef USE_LEAF_STASH
-constexpr int kLeafStashSlots =
-    kNumGroup * (kAssociativity - kGroupOverflowSlots);
-#else
-constexpr int kLeafStashSlots = 0;
-#endif
 constexpr int kGroupSize = kAssociativity * 2 + kGroupOverflowSlots;
-constexpr int kLeafCardinality = kNumGroup * kGroupSize + kLeafStashSlots;
+constexpr int kLeafCardinality = kNumGroup * kGroupSize;
 static_assert(kLeafCardinality == 60);
 
 static inline int key_hash_bucket(const Key &k) { return k % kNumBucket; }
@@ -599,7 +580,6 @@ class LeafPage {
   Header hdr;
   // LeafEntry records[kLeafCardinality];
   LeafEntryGroup groups[kNumGroup];
-  LeafEntry stash[kLeafStashSlots];
 
   // uint8_t padding[1];
   // uint8_t rear_version;
@@ -609,8 +589,6 @@ class LeafPage {
  public:
   LeafPage(uint32_t level = 0) {
     hdr.level = level;
-    set_stash_group_mask(0);
-    set_stash_count(0);
     // records[0].value = kValueNull;
   }
 
@@ -627,26 +605,11 @@ class LeafPage {
     for (int i = 0; i < kNumGroup; ++i) {
       groups[i].set_version(hdr.version);
     }
-    for (int i = 0; i < kLeafStashSlots; ++i) {
-      stash[i].lv.cl_ver = hdr.version;
-    }
     return hdr.version;
   }
-  uint8_t stash_group_mask() const { return hdr.cache_read_gran[0]; }
-  void set_stash_group_mask(uint8_t mask) { hdr.cache_read_gran[0] = mask; }
-  uint8_t stash_count() const { return hdr.grp_in_cache[0]; }
-  void set_stash_count(uint8_t count) { hdr.grp_in_cache[0] = count; }
   uint8_t version() const { return hdr.version; }
-  static constexpr size_t stash_group_mask_page_offset() {
-    return offsetof(LeafPage, hdr) + offsetof(Header, cache_read_gran);
-  }
-  static constexpr size_t control_word_page_offset() {
-    return offsetof(LeafPage, hdr) + offsetof(Header, control_word);
-  }
   LeafEntryGroup *group_at(int idx) { return &groups[idx]; }
   const LeafEntryGroup *group_at(int idx) const { return &groups[idx]; }
-  LeafEntry *stash_entry(int idx) { return &stash[idx]; }
-  const LeafEntry *stash_entry(int idx) const { return &stash[idx]; }
   void debug() const {
     std::cout << "LeafPage@ ";
     hdr.debug();

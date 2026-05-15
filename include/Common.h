@@ -24,7 +24,6 @@
 // #define CONFIG_ENABLE_EMBEDDING_LOCK
 // #define CONFIG_ENABLE_CRC
 // #define USE_DOORBELL_BATCHING
-// #define USE_LEAF_STASH
 
 #define KEY_SIZE 8
 
